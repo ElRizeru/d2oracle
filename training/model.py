@@ -22,7 +22,7 @@ from training.config import (
 
 
 class ExplicitMultiheadAttention(nn.Module):
-    """Standard QKV multi-head attention using explicit matmul/softmax (100% ONNX-safe)."""
+    """Standard QKV multi-head attention using explicit matmul/softmax (ONNX-safe)."""
 
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1) -> None:
         super().__init__()

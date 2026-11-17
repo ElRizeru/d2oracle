@@ -1,4 +1,4 @@
-"""Unit and end-to-end ONNX parity tests for Stage 2 (two-stage training & export)."""
+"""Training and ONNX parity tests."""
 
 from __future__ import annotations
 
@@ -519,7 +519,7 @@ def test_real_patch_vocab_export_parity_and_payload_budget_if_present(tmp_path: 
 
     total_bytes = sum(p.stat().st_size for p in exported.values())
     total_mb = total_bytes / (1024 * 1024)
-    # AGENTS.md: keep total browser model payload reasonable (~15-25 MB max across ONNX + vocab files)
+    # Keep browser model payload within the 25 MB budget
     assert total_mb <= 25.0, f"Browser bundle size {total_mb:.2f} MB exceeded 25 MB budget"
 
 

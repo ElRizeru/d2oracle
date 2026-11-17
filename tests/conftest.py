@@ -1,4 +1,4 @@
-"""Shared test fixtures and mock builders for d2oracle Stage 1 tests."""
+"""Shared test fixtures and mock builders."""
 
 from __future__ import annotations
 
