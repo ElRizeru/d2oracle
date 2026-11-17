@@ -74,11 +74,7 @@ export function validateBundleMetadata(
       `Incompatible model bundle version (${String(modelConfig.model_schema_version ?? 1)}); expected v${EXPECTED_MODEL_SCHEMA_VERSION}. Reload with updated v2 patch bundle files.`,
     );
   }
-  // TODO(post-colab-reexport): tighten to reject undefined once legacy bundled web/public/models/ is replaced.
-  if (
-    modelConfig.encoder_arch_version !== undefined &&
-    modelConfig.encoder_arch_version !== EXPECTED_ENCODER_ARCH_VERSION
-  ) {
+  if (modelConfig.encoder_arch_version !== EXPECTED_ENCODER_ARCH_VERSION) {
     throw new Error(
       `Incompatible encoder architecture version (${String(modelConfig.encoder_arch_version)}); expected v${EXPECTED_ENCODER_ARCH_VERSION}. Reload with updated v2 patch bundle files.`,
     );
