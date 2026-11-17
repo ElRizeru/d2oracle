@@ -49,6 +49,11 @@ class CollectorSettings(BaseSettings):
 
     player_bfs_batch_size: int = Field(default=10, ge=1, le=10)
     player_bfs_cooldown_seconds: int = Field(default=14400, ge=0)
+    player_bfs_max_age_seconds: int = Field(
+        default=0,
+        ge=0,
+        description="Max age of matches to discover via BFS in seconds; 0 means entire active patch from as_of_datetime.",
+    )
     match_retry_cooldown_seconds: int = Field(default=1800, ge=0, le=86400)
 
     log_level: str = "INFO"

@@ -214,13 +214,13 @@ async def test_public_seeds_uses_min_rank_80_and_bfs_skips_prepatch_or_unparsed(
 
     assert captured_params.get("min_rank") == "80"
     assert "startDateTime: $since" in str(captured_gql.get("query") or "")
-    assert captured_gql.get("variables") == {"gv": 190, "since": now_ts - 14 * 86400}
-    assert enqueued == 1
-    assert [m[0] for m in db.pop_pending_matches()] == [8001]
+    assert captured_gql.get("variables") == {"gv": 190, "since": patch_as_of}
+    assert enqueued == 2
+    assert sorted(m[0] for m in db.pop_pending_matches()) == [8001, 8004]
     db.close()
 
 
-async def test_bfs_take_100_unfetched_vs_25_cooldown_repoll(tmp_path: Path) -> None:
+async def test_bfs_queries_entire_patch_and_discovers_prior_matches(tmp_path: Path) -> None:
     db = CollectorDB(tmp_path / "disc_take.sqlite3")
     now_ts = 1794860000
     patch_as_of = now_ts - 30 * 86400
@@ -242,7 +242,7 @@ async def test_bfs_take_100_unfetched_vs_25_cooldown_repoll(tmp_path: Path) -> N
             )
             await eng.discover_bfs_from_players(190, active_gv_as_of=patch_as_of)
 
-            # Force cooldown expiry on already-watermarked player 901 -> re-poll uses take: 25
+            # Force cooldown expiry on already-fetched player 901 -> re-poll still uses take: 100 for full patch
             db.mark_players_fetched_batch([(901, 8800)])
             db._conn.execute(
                 "UPDATE players_queue SET last_fetched_at = last_fetched_at - 15000 WHERE steam_account_id = 901"
@@ -252,5 +252,55 @@ async def test_bfs_take_100_unfetched_vs_25_cooldown_repoll(tmp_path: Path) -> N
 
     assert len(queries) == 2
     assert "take: 100" in queries[0]
-    assert "take: 25" in queries[1]
+    assert "take: 100" in queries[1]
+    db.close()
+
+
+async def test_pro_matches_backfills_historical_to_patch_start(tmp_path: Path) -> None:
+    db = CollectorDB(tmp_path / "pro_backfill.sqlite3")
+    now_ts = 1794860000
+    patch_as_of = now_ts - 10000
+
+    def pro_handler(request: httpx.Request) -> httpx.Response:
+        lt = request.url.params.get("less_than_match_id")
+        if lt is None:
+            return httpx.Response(
+                200,
+                json=[{"match_id": 900500, "start_time": now_ts - 3600, "duration": 2200, "leagueid": 10}],
+            )
+        if lt == "900500":
+            return httpx.Response(
+                200,
+                json=[{"match_id": 900400, "start_time": now_ts - 5000, "duration": 2100, "leagueid": 10}],
+            )
+        if lt == "900400":
+            return httpx.Response(
+                200,
+                json=[
+                    {"match_id": 900300, "start_time": now_ts - 9000, "duration": 2000, "leagueid": 10},
+                    {"match_id": 900100, "start_time": patch_as_of - 1000, "duration": 2300, "leagueid": 10},
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    with respx.mock:
+        respx.get(f"{OPENDOTA_API_URL}/proMatches").mock(side_effect=pro_handler)
+        async with httpx.AsyncClient() as client:
+            od = OpenDotaClient(build_opendota_rate_limiter(), http_client=client)
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            eng = DiscoveryEngine(db=db, stratz=stratz, opendota=od)
+
+            # First run: forward scan discovers 900500, sets known_newest=900500
+            e1 = await eng.discover_pro_matches(patch_as_of, max_pages=1)
+            assert e1 == 1
+            assert db.get_meta("opendota_pro_newest_id") == "900500"
+            assert db.get_meta("opendota_pro_backfill_done") is None
+
+            # Second run: backfill pages backwards from 900500 to patch_as_of
+            e2 = await eng.discover_pro_matches(patch_as_of, max_pages=5)
+            assert e2 == 2  # 900400 and 900300 (900100 is before patch_as_of)
+            assert db.get_meta("opendota_pro_backfill_done") == "1"
+
+    all_queued = sorted(m[0] for m in db.pop_pending_matches())
+    assert all_queued == [900300, 900400, 900500]
     db.close()

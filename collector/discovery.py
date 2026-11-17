@@ -20,7 +20,7 @@ from shared.constants import (
 )
 
 logger = logging.getLogger(__name__)
-DEFAULT_BFS_MAX_AGE_SECONDS: int = 14 * 86400
+DEFAULT_BFS_MAX_AGE_SECONDS: int = 0  # 0 = entire active patch since active_gv_as_of
 MIN_PUBLIC_AVG_RANK_TIER: int = 80
 
 
@@ -153,6 +153,7 @@ class DiscoveryEngine:
         less_than_id: int | None = None
         newest_seen = known_newest
         candidates: list[tuple[int, str]] = []
+        hit_patch_start = False
 
         for _ in range(max_pages):
             try:
@@ -174,6 +175,7 @@ class DiscoveryEngine:
                     continue
                 if st < active_gv_as_of:
                     stop_paging = True
+                    hit_patch_start = True
                     continue
                 # Only advance watermark for matches that have already cleared the parse delay window
                 if (now_ts - st) < self.pro_min_delay_seconds:
@@ -183,13 +185,59 @@ class DiscoveryEngine:
                 if mid > 0 and league_id is not None and dur >= MIN_DURATION_SECONDS:
                     candidates.append((mid, "opendota_pro"))
 
-            min_page_id = min(int(m["match_id"]) for m in page if m.get("match_id"))
+            valid_ids = [int(m["match_id"]) for m in page if m.get("match_id")]
+            if not valid_ids:
+                break
+            min_page_id = min(valid_ids)
             if stop_paging or min_page_id <= 1:
                 break
             less_than_id = min_page_id
 
         if newest_seen > known_newest:
             self.db.set_meta("opendota_pro_newest_id", str(newest_seen))
+
+        if hit_patch_start:
+            self.db.set_meta("opendota_pro_backfill_done", "1")
+        else:
+            if self.db.get_meta("opendota_pro_backfill_cursor") is None and less_than_id is not None:
+                self.db.set_meta("opendota_pro_backfill_cursor", str(less_than_id))
+
+            if self.db.get_meta("opendota_pro_backfill_done") != "1" and known_newest > 0:
+                # Historical backfill: page backwards towards patch start
+                raw_backfill = self.db.get_meta("opendota_pro_backfill_cursor")
+                backfill_cursor = int(raw_backfill) if raw_backfill else less_than_id
+                for _ in range(max_pages):
+                    try:
+                        page = await self.opendota.get_pro_matches(less_than_match_id=backfill_cursor)
+                    except QuotaExhaustedError as exc:
+                        logger.warning("OpenDota quota paused during proMatches backfill: %s", exc)
+                        break
+                    if not page:
+                        self.db.set_meta("opendota_pro_backfill_done", "1")
+                        break
+
+                    page_hit_start = False
+                    for m in page:
+                        mid = int(m.get("match_id") or 0)
+                        st = int(m.get("start_time") or 0)
+                        dur = int(m.get("duration") or 0)
+                        league_id = m.get("leagueid")
+                        if st < active_gv_as_of:
+                            page_hit_start = True
+                            continue
+                        if mid > 0 and league_id is not None and dur >= MIN_DURATION_SECONDS:
+                            candidates.append((mid, "opendota_pro"))
+
+                    valid_ids = [int(m["match_id"]) for m in page if m.get("match_id")]
+                    if not valid_ids:
+                        self.db.set_meta("opendota_pro_backfill_done", "1")
+                        break
+                    min_page_id = min(valid_ids)
+                    backfill_cursor = min_page_id
+                    if page_hit_start or min_page_id <= 1:
+                        self.db.set_meta("opendota_pro_backfill_done", "1")
+                        break
+                    self.db.set_meta("opendota_pro_backfill_cursor", str(backfill_cursor))
 
         inserted = self.db.enqueue_matches(candidates)
         if inserted:
@@ -199,7 +247,7 @@ class DiscoveryEngine:
     async def discover_bfs_from_players(
         self, active_gv_id: int, active_gv_as_of: int = 0
     ) -> int:
-        """Run one 10-player aliased STRATZ BFS batch (without playbackData)."""
+        """Run one 10-player aliased STRATZ BFS batch for the full patch duration."""
         batch = self.db.pop_players_for_bfs(
             limit=self.bfs_batch_size,
             cooldown_seconds=self.bfs_cooldown_seconds,
@@ -216,7 +264,7 @@ class DiscoveryEngine:
             else int(active_gv_as_of or 0)
         )
 
-        bfs_take = 25 if all(wm is not None for _sid, wm in batch) else 100
+        bfs_take = 100
         matches_by_player = await self.stratz.get_players_matches(
             player_ids,
             active_gv_id,
@@ -237,8 +285,6 @@ class DiscoveryEngine:
                 mid_int = int(mid)
                 if max_id is None or mid_int > max_id:
                     max_id = mid_int
-                if prev_watermark is not None and mid_int <= prev_watermark:
-                    continue
                 if "parsedDateTime" in m and m.get("parsedDateTime") is None:
                     continue
                 if "startDateTime" in m:

@@ -668,6 +668,7 @@ async def _run_from_args(args: argparse.Namespace) -> int:
             pro_min_delay_seconds=settings.pro_match_min_delay_seconds,
             bfs_batch_size=settings.player_bfs_batch_size,
             bfs_cooldown_seconds=settings.player_bfs_cooldown_seconds,
+            bfs_max_age_seconds=settings.player_bfs_max_age_seconds,
         )
         runner = CollectorRunner(
             settings=settings,
