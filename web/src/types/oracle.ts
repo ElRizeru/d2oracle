@@ -141,6 +141,7 @@ export interface SkillLevelStep {
   abilityId: number | null;
   label: string;
   shortTag: string;
+  rank?: number;
   isUltimate?: boolean;
   img: string | null;
 }

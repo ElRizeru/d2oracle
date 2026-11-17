@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 
+import { ROLE_NAMES } from "../data/draftPresets";
 import type { DraftSlot, HeroMeta } from "../types/oracle";
 import { HeroPortraitImg } from "./HeroPortraitImg";
 
@@ -124,8 +125,10 @@ export function HeroPickerModal({
   }, [filteredHeroes, attrFilter]);
 
   const slotTitle = targetSlot
-    ? `Select hero for ${targetSlot.side === "radiant" ? "Radiant" : "Dire"} Pos ${targetSlot.position}`
+    ? `Select hero for ${targetSlot.side === "radiant" ? "Radiant" : "Dire"} · ${ROLE_NAMES[targetSlot.position].full}`
     : "Select hero";
+
+  const showAttrMetaInCard = query.trim().length > 0;
 
   const renderHeroOption = (hero: HeroMeta) => {
     const owner = takenHeroMap.get(hero.id);
@@ -133,10 +136,10 @@ export function HeroPickerModal({
     const isEnterTarget =
       query.trim().length > 0 && firstPickableHero?.id === hero.id;
     const ownerTag = owner
-      ? `${owner.side === "radiant" ? "R" : "D"} P${owner.position}`
+      ? `${owner.side === "radiant" ? "Rad" : "Dir"} · ${ROLE_NAMES[owner.position].short}`
       : null;
     const ownerFullLabel = owner
-      ? `${owner.side === "radiant" ? "Radiant" : "Dire"} Pos ${owner.position}`
+      ? `${owner.side === "radiant" ? "Radiant" : "Dire"} ${ROLE_NAMES[owner.position].full}`
       : null;
 
     return (
@@ -159,28 +162,26 @@ export function HeroPickerModal({
             src={hero.img}
             alt={hero.display_name}
             fallbackText={hero.display_name.slice(0, 2)}
-            width={64}
-            height={36}
+            width={44}
+            height={25}
             decorative
           />
         </span>
         <span className="hero-option__meta">
           <span className="hero-option__name">{hero.display_name}</span>
-          <span className="hero-option__sub">
-            {ownerTag && owner ? (
-              <span className={`hero-option__taken hero-option__taken--${owner.side} measured`}>
-                {ownerTag}
-              </span>
-            ) : (
-              <>
-                <span
-                  className={`attr-dot attr-dot--${hero.primary_attr ?? "all"}`}
-                  aria-hidden="true"
-                />
-                <span>{formatAttrShort(hero.primary_attr)}</span>
-              </>
-            )}
-          </span>
+          {ownerTag && owner ? (
+            <span className={`hero-option__taken hero-option__taken--${owner.side} measured`}>
+              {ownerTag}
+            </span>
+          ) : showAttrMetaInCard ? (
+            <span className="hero-option__sub">
+              <span
+                className={`attr-dot attr-dot--${hero.primary_attr ?? "all"}`}
+                aria-hidden="true"
+              />
+              <span>{formatAttrShort(hero.primary_attr)}</span>
+            </span>
+          ) : null}
         </span>
       </button>
     );

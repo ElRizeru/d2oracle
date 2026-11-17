@@ -1,5 +1,12 @@
+import { ROLE_NAMES } from "../data/draftPresets";
 import { formatLead10m, formatWinOddsPair } from "../ml/decoder";
-import type { DraftPrediction, MatchPaceOption } from "../types/oracle";
+import type {
+  DraftPrediction,
+  HeroPrediction,
+  LaneKey,
+  MatchPaceOption,
+} from "../types/oracle";
+import { HeroPortraitImg } from "./HeroPortraitImg";
 
 interface MatchSummaryBarProps {
   prediction: DraftPrediction | null;
@@ -21,9 +28,43 @@ const PACE_OPTIONS: ReadonlyArray<{ value: MatchPaceOption; label: string }> = [
   { value: 50, label: "Late 50m" },
 ];
 
+const LANE_POSITIONS: Record<
+  LaneKey,
+  { radiant: readonly number[]; dire: readonly number[] }
+> = {
+  top: { radiant: [3, 4], dire: [1, 5] },
+  mid: { radiant: [2], dire: [2] },
+  bot: { radiant: [1, 5], dire: [3, 4] },
+};
+
 function toDurationPct(minutes: number): number {
   const clamped = Math.max(SCALE_MIN, Math.min(SCALE_MAX, minutes));
   return ((clamped - SCALE_MIN) / (SCALE_MAX - SCALE_MIN)) * 100;
+}
+
+function getWinEdgeLabel(radLeadDiff: number): string {
+  const absDiff = Math.abs(radLeadDiff);
+  if (absDiff <= 1) {
+    return "Even matchup";
+  }
+  const leader = radLeadDiff > 0 ? "Radiant" : "Dire";
+  if (absDiff < 8) {
+    return `Slight ${leader} edge`;
+  }
+  if (absDiff < 20) {
+    return `${leader} favored`;
+  }
+  return `Strong ${leader} edge`;
+}
+
+function getLaneHeroes(
+  heroes: readonly HeroPrediction[],
+  side: "radiant" | "dire",
+  positions: readonly number[],
+): HeroPrediction[] {
+  return positions
+    .map((pos) => heroes.find((h) => h.side === side && h.position === pos))
+    .filter((h): h is HeroPrediction => h !== undefined);
 }
 
 export function MatchSummaryBar({
@@ -83,14 +124,10 @@ export function MatchSummaryBar({
     prediction.radiantWinProb,
   );
   const radLeadDiff = Number(radPctText) - Number(direPctText);
-  const absDiff = Math.abs(radLeadDiff);
-  const radiantLeads = radLeadDiff > 0.5;
-  const direLeads = radLeadDiff < -0.5;
+  const radiantLeads = radLeadDiff > 1;
+  const direLeads = radLeadDiff < -1;
 
-  const favoredBadgeText =
-    absDiff <= 0.5
-      ? "Even matchup"
-      : `${radiantLeads ? "Radiant" : "Dire"} +${absDiff.toFixed(1)}%`;
+  const favoredBadgeText = getWinEdgeLabel(radLeadDiff);
 
   const favoredBadgeClass = radiantLeads
     ? "summary-badge--radiant"
@@ -109,7 +146,6 @@ export function MatchSummaryBar({
 
   const goldLead = formatLead10m(prediction.goldLead10m);
   const xpLead = formatLead10m(prediction.xpLead10m);
-  const effectiveMin = Math.round(prediction.effectiveDurationMinutes);
 
   return (
     <section
@@ -123,7 +159,7 @@ export function MatchSummaryBar({
       <div className="summary-cell summary-cell--win">
         <div className="summary-cell__top">
           <span>Win probability</span>
-          <span className={`summary-badge ${favoredBadgeClass} measured nowrap`}>
+          <span className={`summary-badge ${favoredBadgeClass} nowrap`}>
             {favoredBadgeText}
           </span>
         </div>
@@ -132,18 +168,8 @@ export function MatchSummaryBar({
           <div className="win-side win-side--radiant">
             <span className="win-side__name">Radiant</span>
             <span className="reading num">{radPctText}%</span>
-            {radiantLeads ? (
-              <span className="win-side__delta win-side__delta--radiant measured">
-                +{absDiff.toFixed(1)}%
-              </span>
-            ) : null}
           </div>
           <div className="win-side win-side--dire">
-            {direLeads ? (
-              <span className="win-side__delta win-side__delta--dire measured">
-                +{absDiff.toFixed(1)}%
-              </span>
-            ) : null}
             <span className="win-side__name">Dire</span>
             <span className="reading num">{direPctText}%</span>
           </div>
@@ -174,9 +200,11 @@ export function MatchSummaryBar({
       <div className="summary-cell summary-cell--duration">
         <div className="summary-cell__top">
           <span>Expected match time</span>
-          <span className="summary-badge measured nowrap">
-            {matchPace === 0 ? `Builds @ ~${effectiveMin}m` : `Builds @ ${matchPace}m`}
-          </span>
+          {matchPace !== 0 ? (
+            <span className="summary-badge summary-badge--pace measured nowrap">
+              Builds @ {matchPace}m
+            </span>
+          ) : null}
         </div>
 
         <div className="duration-headline">
@@ -215,8 +243,14 @@ export function MatchSummaryBar({
             />
           </div>
           <div className="duration-scale__labels measured" aria-hidden="true">
-            {SCALE_TICKS.map((tick) => (
-              <span key={tick}>{tick}m</span>
+            {SCALE_TICKS.map((tick, idx) => (
+              <span
+                key={tick}
+                className={`duration-scale__tick-label ${idx === 0 ? "is-start" : idx === SCALE_TICKS.length - 1 ? "is-end" : ""}`}
+                style={{ left: `${toDurationPct(tick)}%` }}
+              >
+                {tick}m
+              </span>
             ))}
           </div>
         </div>
@@ -255,49 +289,98 @@ export function MatchSummaryBar({
         </div>
 
         <div className="laning-grid">
-          {prediction.lanes.map((lane) => (
-            <div key={lane.lane} className="lane-card">
-              <div className="lane-card__head">
-                <span className="lane-card__title">{lane.label}</span>
-                <span
-                  className={`lane-card__verdict lane-card__verdict--${lane.verdictSide} measured nowrap`}
+          {prediction.lanes.map((lane) => {
+            const posMap = LANE_POSITIONS[lane.lane];
+            const radHeroes = getLaneHeroes(prediction.heroes, "radiant", posMap.radiant);
+            const direHeroes = getLaneHeroes(prediction.heroes, "dire", posMap.dire);
+            const matchupTitle = `${radHeroes.map((h) => `${h.hero.display_name} (${ROLE_NAMES[h.position].short})`).join(" + ")} vs ${direHeroes.map((h) => `${h.hero.display_name} (${ROLE_NAMES[h.position].short})`).join(" + ")}`;
+
+            return (
+              <div key={lane.lane} className="lane-card">
+                <div className="lane-card__head">
+                  <span className="lane-card__title">{lane.label}</span>
+                  <span
+                    className={`lane-card__verdict lane-card__verdict--${lane.verdictSide} nowrap`}
+                  >
+                    {lane.verdict}
+                  </span>
+                </div>
+
+                {radHeroes.length > 0 && direHeroes.length > 0 ? (
+                  <div className="lane-card__matchup" title={matchupTitle}>
+                    <span className="lane-card__heroes lane-card__heroes--radiant">
+                      {radHeroes.map((hp) => (
+                        <span key={hp.slotIdx} className="lane-hero-chip">
+                          <HeroPortraitImg
+                            src={hp.hero.img}
+                            alt={hp.hero.display_name}
+                            fallbackText={hp.hero.display_name.slice(0, 2)}
+                            width={28}
+                            height={16}
+                          />
+                        </span>
+                      ))}
+                    </span>
+                    <span className="lane-card__vs" aria-hidden="true">
+                      vs
+                    </span>
+                    <span className="lane-card__heroes lane-card__heroes--dire">
+                      {direHeroes.map((hp) => (
+                        <span key={hp.slotIdx} className="lane-hero-chip">
+                          <HeroPortraitImg
+                            src={hp.hero.img}
+                            alt={hp.hero.display_name}
+                            fallbackText={hp.hero.display_name.slice(0, 2)}
+                            width={28}
+                            height={16}
+                          />
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                ) : null}
+
+                <div
+                  className="lane-bar"
+                  role="img"
+                  aria-label={`${lane.label} lane: Radiant ${lane.radiantPct} percent, Even ${lane.evenPct} percent, Dire ${lane.direPct} percent`}
                 >
-                  {lane.verdict}
-                </span>
-              </div>
+                  {lane.radiantPct > 0 ? (
+                    <span
+                      className="lane-bar__seg lane-bar__seg--radiant"
+                      style={{ width: `${lane.radiantPct}%` }}
+                    />
+                  ) : null}
+                  {lane.evenPct > 0 ? (
+                    <span
+                      className="lane-bar__seg lane-bar__seg--even"
+                      style={{ width: `${lane.evenPct}%` }}
+                    />
+                  ) : null}
+                  {lane.direPct > 0 ? (
+                    <span
+                      className="lane-bar__seg lane-bar__seg--dire"
+                      style={{ width: `${lane.direPct}%` }}
+                    />
+                  ) : null}
+                </div>
 
-              <div
-                className="lane-bar"
-                role="img"
-                aria-label={`${lane.label} lane: Radiant ${lane.radiantPct} percent, Even ${lane.evenPct} percent, Dire ${lane.direPct} percent`}
-              >
-                {lane.radiantPct > 0 ? (
+                <div className="lane-card__nums measured" aria-hidden="true">
                   <span
-                    className="lane-bar__seg lane-bar__seg--radiant"
-                    style={{ width: `${lane.radiantPct}%` }}
-                  />
-                ) : null}
-                {lane.evenPct > 0 ? (
+                    className={`lane-num lane-num--radiant ${lane.verdictSide === "radiant" ? "is-winner" : ""}`}
+                  >
+                    Rad {lane.radiantPct}%
+                  </span>
+                  <span className="lane-num lane-num--even">Even {lane.evenPct}%</span>
                   <span
-                    className="lane-bar__seg lane-bar__seg--even"
-                    style={{ width: `${lane.evenPct}%` }}
-                  />
-                ) : null}
-                {lane.direPct > 0 ? (
-                  <span
-                    className="lane-bar__seg lane-bar__seg--dire"
-                    style={{ width: `${lane.direPct}%` }}
-                  />
-                ) : null}
+                    className={`lane-num lane-num--dire ${lane.verdictSide === "dire" ? "is-winner" : ""}`}
+                  >
+                    Dire {lane.direPct}%
+                  </span>
+                </div>
               </div>
-
-              <div className="lane-card__nums measured" aria-hidden="true">
-                <span className="lane-num lane-num--radiant">Rad {lane.radiantPct}%</span>
-                <span className="lane-num lane-num--even">Even {lane.evenPct}%</span>
-                <span className="lane-num lane-num--dire">Dire {lane.direPct}%</span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </section>

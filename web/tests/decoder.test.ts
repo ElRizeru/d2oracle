@@ -35,7 +35,9 @@ import {
   getMaxUltRankForLevel,
   getSkippedSkillLevel,
   roundPercentagesTo100,
+  sanitizeDisplayText,
   selectNextItemToken,
+  summarizeEarlySkillBuild,
 } from "../src/ml/decoder";
 import {
   predictDraft,
@@ -397,6 +399,40 @@ describe("decodeSkillBuild1To18 & decodeTalentChoices", () => {
     expect(talents[1]!.chosenSide).toBe(1);
     expect(talents[1]!.options.map((o) => o.id)).toEqual([603, 605]);
     expect(talents[1]!.abilityId).toBe(605);
+  });
+
+  it("sanitizes %% talent text, tracks earned ability ranks, and summarizes early skill builds", () => {
+    expect(sanitizeDisplayText("+30%% Rip Tide Damage")).toBe("+30% Rip Tide Damage");
+    expect(sanitizeDisplayText("-50%% Viper Strike Mana Cost / Cooldown")).toBe(
+      "-50% Viper Strike Mana Cost / Cooldown",
+    );
+
+    const hero = makeStandardHero();
+    const abilities = {
+      ...makeAbilitiesMap(),
+      "601": { id: 601, name: "tal_10_l", display_name: "+30%% Rip Tide Damage", is_talent: true, img: null },
+    };
+    const talentLogits = new Float32Array([2.0, 0.1, 1.0, 0.2, 1.0, 0.2, 1.0, 0.2]);
+    const talents = decodeTalentChoices(hero, talentLogits, 0, abilities);
+    expect(talents[0]!.displayName).toBe("+30% Rip Tide Damage");
+    expect(talents[0]!.options[0]!.displayName).toBe("+30% Rip Tide Damage");
+
+    const numClasses = 16;
+    const skillLogits = new Float32Array(18 * numClasses).fill(-2);
+    for (let lvl = 0; lvl < 18; lvl++) {
+      skillLogits[lvl * numClasses + 3] = 10.0;
+      skillLogits[lvl * numClasses + 0] = 8.0;
+      skillLogits[lvl * numClasses + 1] = 6.0;
+      skillLogits[lvl * numClasses + 2] = 4.0;
+      skillLogits[lvl * numClasses + 14] = 9.0;
+      skillLogits[lvl * numClasses + 15] = 1.0;
+    }
+    const steps = decodeSkillBuild1To18(hero, skillLogits, 0, numClasses, 14, 15, abilities);
+    const qRanks = steps.filter((s) => s.shortTag === "Q").map((s) => s.rank);
+    expect(qRanks).toEqual([1, 2, 3, 4]);
+    const rRanks = steps.filter((s) => s.shortTag === "R").map((s) => s.rank);
+    expect(rRanks).toEqual([1, 2, 3]);
+    expect(summarizeEarlySkillBuild(hero, steps, abilities, 6)).toBe("3-2-0-1");
   });
 
   it("audits vocab.json heroes and enforces slot/ultimate rules for Morphling, Dark Willow, Meepo, and 5-skill heroes", () => {

@@ -265,6 +265,7 @@ export function App() {
         <BuildInspector
           prediction={prediction}
           vocab={bundle?.vocab ?? null}
+          matchPace={matchPace}
         />
       </main>
 
@@ -288,17 +289,17 @@ export function App() {
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
-                strokeWidth="1.75"
+                strokeWidth="1.65"
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 aria-hidden="true"
               >
-                <circle cx="12" cy="10.5" r="7.5" />
-                <circle cx="9.3" cy="9.2" r="0.9" fill="currentColor" stroke="none" />
-                <circle cx="14.7" cy="9.2" r="0.9" fill="currentColor" stroke="none" />
-                <path d="M9 12.2a3.3 3.3 0 0 0 6 0" />
-                <path d="M5.2 14.8c-1.1.8-1.4 2.4-.5 3.6.8 1 2.2 1.1 3.3.2l1.8-1.5" />
-                <path d="M18.8 14.8c1.1.8 1.4 2.4.5 3.6-.8 1-2.2 1.1-3.3.2l-1.8-1.5" />
+                <path d="M5.5 11.5a6.5 6.5 0 1 1 13 0" />
+                <circle cx="9.5" cy="9.6" r="0.85" fill="currentColor" stroke="none" />
+                <circle cx="14.5" cy="9.6" r="0.85" fill="currentColor" stroke="none" />
+                <path d="M9 12.2a3.2 3.2 0 0 0 6 0" />
+                <path d="M4.2 13.6c-.8.4-1.2 1.4-.7 2.4.5 1.1 1.7 2.2 3.2 2.9 1 .5 1.9.4 2.4-.3.4-.6.1-1.5-.7-2l-1.5-.9c-.4-.3-.3-1.1.1-1.4" />
+                <path d="M19.8 13.6c.8.4 1.2 1.4.7 2.4-.5 1.1-1.7 2.2-3.2 2.9-1 .5-1.9.4-2.4-.3-.4-.6-.1-1.5.7-2l1.5-.9c.4-.3.3-1.1-.1-1.4" />
               </svg>
             </a>
             <a

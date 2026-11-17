@@ -2,6 +2,14 @@ import type { DraftSlot, HeroMeta, MatchPaceOption, RolePosition } from "../type
 
 const POSITIONS: readonly RolePosition[] = [1, 2, 3, 4, 5];
 
+export const ROLE_NAMES: Record<RolePosition, { full: string; short: string }> = {
+  1: { full: "Safe carry", short: "Carry" },
+  2: { full: "Mid lane", short: "Mid" },
+  3: { full: "Offlane", short: "Offlane" },
+  4: { full: "Soft support", short: "Soft supp" },
+  5: { full: "Hard support", short: "Hard supp" },
+};
+
 export const VALID_MATCH_PACES: readonly MatchPaceOption[] = [0, 25, 35, 50];
 
 export function createEmptyDraft(): DraftSlot[] {

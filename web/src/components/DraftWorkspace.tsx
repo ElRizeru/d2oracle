@@ -4,13 +4,17 @@ import {
   GripVertical,
   Link2,
   Loader2,
+  Plus,
   RotateCcw,
   Shuffle,
   X,
 } from "lucide-react";
 
-import type { DraftSlot, HeroMeta, RolePosition } from "../types/oracle";
+import { ROLE_NAMES } from "../data/draftPresets";
+import type { DraftSlot, HeroMeta } from "../types/oracle";
 import { HeroPortraitImg } from "./HeroPortraitImg";
+
+export { ROLE_NAMES };
 
 interface DraftWorkspaceProps {
   slots: readonly DraftSlot[];
@@ -26,14 +30,6 @@ interface DraftWorkspaceProps {
   onRandomDraft: () => void;
   onClearAll: () => void;
 }
-
-export const ROLE_NAMES: Record<RolePosition, { full: string; short: string }> = {
-  1: { full: "Safe carry", short: "Carry" },
-  2: { full: "Mid lane", short: "Mid" },
-  3: { full: "Offlane", short: "Offlane" },
-  4: { full: "Soft support", short: "Soft supp" },
-  5: { full: "Hard support", short: "Hard supp" },
-};
 
 export function DraftWorkspace({
   slots,
@@ -161,7 +157,7 @@ export function DraftWorkspace({
           setDragSourceSlotIdx(null);
           setDragOverSlotIdx(null);
         }}
-        className={`draft-slot ${hero ? "is-filled" : "is-empty"} ${isDragging ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`}
+        className={`draft-slot draft-slot--${slot.side} ${hero ? "is-filled" : "is-empty"} ${isDragging ? "is-dragging" : ""} ${isDropTarget ? "is-drop-target" : ""}`}
       >
         <div className="draft-slot__pos">
           {canDrag ? (
@@ -211,12 +207,17 @@ export function DraftWorkspace({
               </span>
             </>
           ) : (
-            <span className="draft-slot__placeholder">Pick hero</span>
+            <>
+              <span className="draft-slot__thumb draft-slot__thumb--empty" aria-hidden="true">
+                <Plus size={14} />
+              </span>
+              <span className="draft-slot__placeholder">Pick hero</span>
+            </>
           )}
         </button>
 
-        <div className="draft-slot__actions" aria-hidden={!hero || undefined}>
-          {hero ? (
+        {hero ? (
+          <div className="draft-slot__actions">
             <button
               type="button"
               className="btn btn--icon"
@@ -227,8 +228,8 @@ export function DraftWorkspace({
             >
               <X size={14} aria-hidden="true" />
             </button>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -256,7 +257,7 @@ export function DraftWorkspace({
         <div className="draft-toolbar__controls">
           <button
             type="button"
-            className="btn"
+            className={`btn ${filledCount === 0 ? "btn--tinted" : ""}`}
             disabled={!bundleReady || predicting}
             onClick={onRandomDraft}
           >
@@ -280,7 +281,7 @@ export function DraftWorkspace({
 
           <button
             type="button"
-            className="btn"
+            className="btn btn--quiet"
             disabled={!bundleReady || filledCount === 0 || predicting}
             onClick={onClearAll}
           >

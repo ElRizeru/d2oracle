@@ -440,16 +440,19 @@ export function decodeSkillBuild1To18(
       const aid = matchedEntry?.abilityId ?? skills[chosen] ?? null;
       const ab = matchedEntry?.ability ?? (aid !== null ? abilitiesById[String(aid)] : undefined);
       const shortTag = matchedEntry?.shortTag ?? "?";
+      let earnedRank = counts[chosen] ?? 1;
       if (shortTag === "Q" || shortTag === "W" || shortTag === "E" || shortTag === "R") {
         countsByTag[shortTag] = (countsByTag[shortTag] ?? 0) + 1;
+        earnedRank = countsByTag[shortTag]!;
       }
       steps.push({
         level,
         kind: "ability",
         slotClass: chosen,
         abilityId: aid,
-        label: ab?.display_name || ab?.name || `Ability ${chosen + 1}`,
+        label: sanitizeDisplayText(ab?.display_name || ab?.name || `Ability ${chosen + 1}`),
         shortTag,
+        rank: earnedRank,
         isUltimate: matchedEntry?.isUltimate ?? false,
         img: ab?.img ?? null,
       });
@@ -457,6 +460,40 @@ export function decodeSkillBuild1To18(
   }
 
   return steps;
+}
+
+export function sanitizeDisplayText(raw: string): string {
+  return raw.replace(/%%/g, "%");
+}
+
+export function summarizeEarlySkillBuild(
+  hero: HeroMeta,
+  skills: readonly SkillLevelStep[],
+  abilitiesById: Record<string, AbilityMeta>,
+  upToLevel: number = 6,
+): string {
+  const entries = getLevelableSkillEntries(hero, abilitiesById);
+  if (entries.length === 0) {
+    return "";
+  }
+  const counts = new Map<number, number>();
+  for (const entry of entries) {
+    counts.set(entry.origSlotIdx, 0);
+  }
+  for (const step of skills) {
+    if (step.level > upToLevel || step.kind !== "ability") {
+      continue;
+    }
+    if (counts.has(step.slotClass)) {
+      counts.set(step.slotClass, (counts.get(step.slotClass) ?? 0) + 1);
+    } else {
+      const matched = entries.find((e) => e.shortTag === step.shortTag);
+      if (matched) {
+        counts.set(matched.origSlotIdx, (counts.get(matched.origSlotIdx) ?? 0) + 1);
+      }
+    }
+  }
+  return entries.map((entry) => counts.get(entry.origSlotIdx) ?? 0).join("-");
 }
 
 export function decodeTalentChoices(
@@ -476,7 +513,7 @@ export function decodeTalentChoices(
     for (const rawId of rawIds) {
       const ab = abilitiesById[String(rawId)];
       const internalName = ab?.name || `tal_${rawId}`;
-      const displayName = ab?.display_name || internalName;
+      const displayName = sanitizeDisplayText(ab?.display_name || internalName);
       if (!deduped.some((entry) => entry.name === internalName)) {
         deduped.push({ id: rawId, name: internalName, displayName });
       }
