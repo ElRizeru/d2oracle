@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "d2oracle"
+version = "0.1.0"
+description = "d2oracle — Dota 2 draft dataset collector and prediction model"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27.0,<1.0.0",
+  "tenacity>=9.0.0,<10.0.0",
+  "polars>=1.9.0,<2.0.0",
+  "pyarrow>=17.0.0,<22.0.0",
+  "huggingface-hub>=0.26.0,<2.0.0",
+  "pydantic>=2.9.0,<3.0.0",
+  "pydantic-settings>=2.6.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "torch>=2.3.0,<3.0.0",
+  "onnx>=1.16.0,<2.0.0",
+  "onnxruntime>=1.18.0,<2.0.0",
+  "numpy>=1.26.0,<3.0.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0,<9.0.0",
+  "pytest-asyncio>=0.24.0,<1.0.0",
+  "respx>=0.21.1,<1.0.0",
+  "ruff>=0.7.0,<1.0.0",
+]
+
+[project.scripts]
+d2oracle-collector = "collector.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["shared", "collector", "training"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]

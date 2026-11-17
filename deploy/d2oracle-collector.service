@@ -1,0 +1,26 @@
+[Unit]
+Description=d2oracle Dota 2 Immortal & Pro Match Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=d2oracle
+Group=d2oracle
+WorkingDirectory=/opt/d2oracle
+Environment="HF_HOME=/opt/d2oracle/data/hf_cache"
+EnvironmentFile=/opt/d2oracle/.env
+ExecStart=/opt/d2oracle/.venv/bin/d2oracle-collector
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/d2oracle/data
+
+[Install]
+WantedBy=multi-user.target

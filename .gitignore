@@ -1,0 +1,57 @@
+# Environment & secrets (NEVER commit)
+.env
+.env.*
+!.env.example
+/AGENTS.md
+
+# Local databases & data shards
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+*.parquet
+/data/
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ML artifacts & checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+!web/public/models/*.onnx
+*.onnx.data
+checkpoints/
+/exports/
+runs/
+wandb/
+
+# Node / Web
+node_modules/
+web/dist/
+web/public/ort/
+.vite/
+deno.lock
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

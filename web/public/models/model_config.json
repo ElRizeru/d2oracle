@@ -1,0 +1,31 @@
+{
+  "game_version_id": 190,
+  "game_version_name": "7.41f",
+  "num_heroes": 127,
+  "item_vocab_size": 104,
+  "max_item_len": 12,
+  "max_hero_skills": 14,
+  "num_skill_classes": 16,
+  "slot_talent": 14,
+  "slot_attr": 15,
+  "d_model": 128,
+  "nhead": 4,
+  "num_encoder_layers": 2,
+  "num_decoder_layers": 2,
+  "dim_feedforward": 256,
+  "dropout": 0.1,
+  "model_schema_version": 2,
+  "parquet_schema_version": 2,
+  "vocab_schema_version": 2,
+  "target_scales": {
+    "duration_center_min": 35.0,
+    "duration_scale_min": 10.0,
+    "min_match_duration_min": 15.0,
+    "max_duration_override_min": 120.0,
+    "gold_xp_lead_scale": 1000.0,
+    "dpm_hpm_scale": 100.0,
+    "gpm_xpm_scale": 100.0,
+    "item_time_scale_min": 10.0,
+    "heal_share_min_team_sum": 500.0
+  }
+}

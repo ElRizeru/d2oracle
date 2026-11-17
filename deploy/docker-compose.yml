@@ -1,0 +1,25 @@
+services:
+  collector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: d2oracle-collector
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - ../.env
+    environment:
+      SQLITE_PATH: /app/data/d2oracle.sqlite3
+      PARQUET_DIR: /app/data/shards
+      CONSTANTS_CACHE_DIR: /app/data/constants
+      HF_HOME: /app/data/hf_cache
+    volumes:
+      - collector_data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "25m"
+        max-file: "5"
+
+volumes:
+  collector_data:
