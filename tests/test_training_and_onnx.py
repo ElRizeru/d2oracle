@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +40,18 @@ from training.dataset import (
     load_parquet_rows,
     split_rows_train_val,
 )
+from training.diagnostics import (
+    collect_validation_diagnostics,
+    format_sample_comparison,
+    package_export_bundle,
+    write_training_report,
+)
 from training.export_onnx import export_to_onnx
-from training.losses import compute_multitask_loss
+from training.losses import (
+    compute_batch_metrics,
+    compute_multitask_loss,
+    compute_multitask_loss_tensors,
+)
 from training.model import CausalSkillHead, D2OracleEncoder, D2OracleModel
 from training.train import (
     _compute_val_selection_score,
@@ -1849,3 +1860,147 @@ def test_stage1_pairwise_symmetry_freeze_isolation_and_two_phase_resume(
     assert exported["encoder"].exists()
     parity = verify_onnx_parity(res_full["best_checkpoint"], cfg.export_dir, atol=1e-4)
     assert parity["passed"] is True
+
+
+def test_fully_masked_branchless_loss_and_diagnostics_bundle(
+    tmp_path: Path, sample_vocab: dict[str, Any]
+) -> None:
+    vidx = VocabIndex(sample_vocab)
+    shard_path = tmp_path / "shard_diag.parquet"
+    rows = [
+        _make_training_row(
+            match_id=9700 + i,
+            start_datetime=1763000000 + i * 600,
+            radiant_win=(i % 2 == 0),
+            is_pro=(i % 4 == 0),
+            duration_seconds=1800 + i * 90,
+        )
+        for i in range(12)
+    ]
+    tbl = pa.Table.from_pylist(rows, schema=PARQUET_ARROW_SCHEMA)
+    pq.write_table(tbl, shard_path, compression="zstd")
+
+    cfg = TrainingConfig(
+        checkpoint_dir=tmp_path / "ckpt",
+        data_dir=tmp_path / "data",
+        export_dir=tmp_path / "export",
+        d_model=32,
+        nhead=4,
+        num_encoder_layers=1,
+        num_decoder_layers=1,
+        dim_feedforward=64,
+        stage1_pair_dim=8,
+        max_item_len=8,
+        batch_size=6,
+        epochs=2,
+        stage1_epochs=1,
+        val_split=0.25,
+        pro_val_min_count=0,
+        use_amp=False,
+    )
+    res = train_from_shards(
+        [shard_path],
+        sample_vocab,
+        cfg,
+        manifest={"game_version_id": 190, "game_version_name": "7.41f"},
+    )
+    assert res["best_epoch"] in (1, 2)
+    assert res["best_stage1_epoch"] == 1
+    assert res["dataset_summary"]["num_total"] == 12
+    assert res["dataset_summary"]["num_val"] == 3
+    assert res["val_ds"] is not None
+
+    exported = export_to_onnx(res["best_checkpoint"], cfg.export_dir)
+    parity = verify_onnx_parity(res["best_checkpoint"], cfg.export_dir, atol=1e-4)
+    assert parity["passed"] is True
+
+    # Branchless loss & metric tensors must match float outputs and keep grads finite on all-masked batch
+    model = D2OracleModel(res["spec"], vidx.build_skill_mask())
+    raw_b = next(iter(TensorBatchLoader(res["val_ds"], batch_size=3, shuffle=False)))
+    masked_b = {k: v.clone() for k, v in raw_b.items()}
+    masked_b["lane_targets"].fill_(IGNORE_INDEX)
+    masked_b["lead10_mask"].zero_()
+    masked_b["combat_rate_mask"].zero_()
+    masked_b["combat_share_mask"].zero_()
+    masked_b["econ_kda_mask"].zero_()
+    masked_b["item_target_ids"].fill_(PAD_ITEM_ID)
+    masked_b["item_time_mask"].zero_()
+    masked_b["skill_targets"].fill_(IGNORE_INDEX)
+    masked_b["talent_targets"].fill_(IGNORE_INDEX)
+    masked_b["is_pro_meta"].zero_()
+
+    out = model(
+        masked_b["hero_idx"],
+        masked_b["is_radiant"],
+        masked_b["pos_idx"],
+        masked_b["item_input_ids"],
+    )
+    loss_f, sc_f = compute_multitask_loss(out, masked_b, cfg, stage_mode="all")
+    loss_t, sc_t = compute_multitask_loss_tensors(out, masked_b, cfg, stage_mode="all")
+    assert float(loss_f.item()) == pytest.approx(float(loss_t.item()), abs=1e-6)
+    for k in sc_f:
+        assert sc_f[k] == pytest.approx(float(sc_t[k].item()), abs=1e-6)
+    loss_t.backward()
+    assert torch.isfinite(loss_t)
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+    bm = compute_batch_metrics(out, masked_b)
+    assert "pro_win_acc" not in bm
+    assert bm["lane_acc"] == (0.0, 0)
+
+    # Full validation diagnostics + sample comparison + report packaging
+    diag = collect_validation_diagnostics(
+        res["best_checkpoint"],
+        res["val_ds"],
+        vidx,
+        cfg,
+        max_eval_matches=10,
+        max_decode_matches=3,
+    )
+    assert diag["num_evaluated"] == 3
+    assert diag["win_calibration"]["count"] == 3
+    assert "P1" in diag["per_position"] and "combat_share_mae" in diag["per_position"]["P1"]
+    assert diag["duration_override_check"]["stage1_win_max_diff"] < 1e-5
+    assert diag["item_decode_stats"]["num_decoded_matches"] == 3
+
+    sample_txt = format_sample_comparison(
+        res["sample_match"], vidx, sample_vocab, cfg, cfg.export_dir
+    )
+    assert "True Lanes:" in sample_txt
+    assert "Pred(auto):" in sample_txt
+    assert "True      :" in sample_txt
+
+    report_dir = tmp_path / "report"
+    written = write_training_report(
+        report_dir,
+        train_result=res,
+        cfg=cfg,
+        vocab=sample_vocab,
+        exported=exported,
+        parity=parity,
+        diagnostics=diag,
+        sample_comparison=sample_txt,
+    )
+    assert written["summary_md"].exists()
+    assert written["training_summary"].exists()
+    assert written["history"].exists()
+
+    archive_path = package_export_bundle(tmp_path / "d2oracle_exports", cfg.export_dir, report_dir)
+    assert archive_path.exists()
+    with zipfile.ZipFile(archive_path) as zf:
+        names = set(zf.namelist())
+        assert "d2oracle_encoder.onnx" in names
+        assert "d2oracle_item_decoder.onnx" in names
+        assert "model_config.json" in names
+        assert "vocab.json" in names
+        assert "report/history.json" in names
+        assert "report/training_config.json" in names
+        assert "report/training_summary.json" in names
+        assert "report/summary.md" in names
+        assert "report/sample_predictions.txt" in names
+    assert sorted(p.name for p in cfg.export_dir.iterdir()) == [
+        "d2oracle_encoder.onnx",
+        "d2oracle_item_decoder.onnx",
+        "model_config.json",
+        "vocab.json",
+    ]

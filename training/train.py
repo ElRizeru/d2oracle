@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,11 @@ from training.dataset import (
     download_hf_dataset,
     infer_zero_talent_tiers,
 )
-from training.losses import compute_batch_metrics, compute_multitask_loss
+from training.losses import (
+    _OPTIONAL_STRATIFIED_METRICS,
+    compute_batch_metric_tensors,
+    compute_multitask_loss_tensors,
+)
 from training.model import D2OracleModel
 
 logger = logging.getLogger("d2oracle.training")
@@ -63,12 +68,19 @@ def build_model_spec(vidx: VocabIndex, cfg: TrainingConfig) -> ModelSpec:
     )
 
 
-def _aggregate_metrics(
-    totals: dict[str, tuple[float, int]],
+def _aggregate_metric_tensors(
+    totals: dict[str, tuple[torch.Tensor, torch.Tensor]],
 ) -> dict[str, float]:
     out: dict[str, float] = {}
-    for k, (num, den) in totals.items():
-        out[k] = num / den if den > 0 else 0.0
+    if not totals:
+        return out
+    keys = list(totals.keys())
+    nums = torch.stack([totals[k][0] for k in keys]).cpu().tolist()
+    dens = torch.stack([totals[k][1] for k in keys]).cpu().tolist()
+    for k, num, den in zip(keys, nums, dens, strict=True):
+        if den <= 0 and k in _OPTIONAL_STRATIFIED_METRICS:
+            continue
+        out[k] = float(num / den) if den > 0 else 0.0
     return out
 
 
@@ -203,11 +215,11 @@ def _run_epoch(
     amp_enabled = cfg.use_amp and device.type == "cuda"
     trainable_params = [p for p in model.parameters() if p.requires_grad] if is_train else []
 
-    loss_sums: dict[str, float] = {}
-    metric_totals: dict[str, tuple[float, int]] = {}
-    win_probs_all: list[np.ndarray] = []
-    win_targets_all: list[np.ndarray] = []
-    pro_flags_all: list[np.ndarray] = []
+    loss_sums: dict[str, torch.Tensor] = {}
+    metric_totals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    win_probs_all: list[torch.Tensor] = []
+    win_targets_all: list[torch.Tensor] = []
+    pro_flags_all: list[torch.Tensor] = []
     steps = 0
 
     for raw_batch in loader:
@@ -237,7 +249,7 @@ def _run_epoch(
                         scenario_mix=scenario_mix if is_train else 0.0,
                         duration_mix=duration_mix if is_train else 0.0,
                     )
-                loss, scalars = compute_multitask_loss(
+                loss, scalars = compute_multitask_loss_tensors(
                     outputs, batch, cfg, stage_mode=stage_mode
                 )
 
@@ -254,28 +266,36 @@ def _run_epoch(
 
         steps += 1
         for k, v in scalars.items():
-            loss_sums[k] = loss_sums.get(k, 0.0) + v
+            loss_sums[k] = loss_sums[k] + v if k in loss_sums else v
 
-        win_probs_all.append(outputs["win_prob"].squeeze(-1).detach().cpu().numpy())
-        win_targets_all.append(batch["radiant_win"].detach().cpu().numpy())
+        win_probs_all.append(outputs["win_prob"].squeeze(-1).detach())
+        win_targets_all.append(batch["radiant_win"].detach())
         if "is_pro_meta" in batch:
-            pro_flags_all.append(batch["is_pro_meta"].detach().cpu().numpy().astype(bool))
+            pro_flags_all.append(batch["is_pro_meta"].detach().bool())
 
-        batch_metrics = compute_batch_metrics(outputs, batch)
-        for k, (num, den) in batch_metrics.items():
-            prev_num, prev_den = metric_totals.get(k, (0.0, 0))
-            metric_totals[k] = (prev_num + num, prev_den + den)
+        batch_metrics = compute_batch_metric_tensors(outputs, batch)
+        for k, (num_t, den_t) in batch_metrics.items():
+            if k in metric_totals:
+                prev_num, prev_den = metric_totals[k]
+                metric_totals[k] = (prev_num + num_t, prev_den + den_t)
+            else:
+                metric_totals[k] = (num_t, den_t)
 
-    summary = {k: v / max(1, steps) for k, v in loss_sums.items()}
-    summary.update(_aggregate_metrics(metric_totals))
+    if loss_sums:
+        l_keys = list(loss_sums.keys())
+        l_vals = torch.stack([loss_sums[k] for k in l_keys]).cpu().tolist()
+        summary = {k: float(v) / max(1, steps) for k, v in zip(l_keys, l_vals, strict=True)}
+    else:
+        summary = {}
+    summary.update(_aggregate_metric_tensors(metric_totals))
     if win_probs_all:
-        yp = np.concatenate(win_probs_all)
-        yt = np.concatenate(win_targets_all)
+        yp = torch.cat(win_probs_all).cpu().numpy()
+        yt = torch.cat(win_targets_all).cpu().numpy()
         auc = _binary_roc_auc(yt, yp)
         if auc is not None:
             summary["win_auc"] = auc
         if pro_flags_all:
-            pm = np.concatenate(pro_flags_all)
+            pm = torch.cat(pro_flags_all).cpu().numpy().astype(bool)
             if pm.any():
                 p_auc = _binary_roc_auc(yt[pm], yp[pm])
                 if p_auc is not None:
@@ -435,17 +455,19 @@ def _log_epoch_summary(
     train_stats: dict[str, float],
     val_stats: dict[str, float],
     val_score: float,
+    elapsed_sec: float | None = None,
 ) -> None:
     auc_str = f" auc={val_stats['win_auc']:.4f}" if "win_auc" in val_stats else ""
     pro_str = ""
     if "pro_win_acc" in val_stats:
         pro_auc = f", p_auc={val_stats['pro_win_auc']:.3f}" if "pro_win_auc" in val_stats else ""
         pro_str = f" | pro_win={val_stats['pro_win_acc']:.3f}{pro_auc}"
+    time_str = f" | {elapsed_sec:.1f}s" if elapsed_sec is not None else ""
 
     if phase_label == "Phase 1":
         logger.info(
             "Epoch %02d/%02d [Phase 1] | train=%.4f val=%.4f s1_score=%.4f |%s "
-            "win=%.3f dur=%.2fm lane=%.3f lead10_g=%.0f%s",
+            "win=%.3f dur=%.2fm lane=%.3f lead10_g=%.0f%s%s",
             epoch,
             total_epochs,
             train_stats["loss_total"],
@@ -457,6 +479,7 @@ def _log_epoch_summary(
             val_stats["lane_acc"],
             val_stats["lead10_gold_mae"],
             pro_str,
+            time_str,
         )
         return
 
@@ -464,7 +487,7 @@ def _log_epoch_summary(
     logger.info(
         "Epoch %02d/%02d [%s%s] | train=%.4f val=%.4f score=%.4f |%s "
         "win=%.3f dur=%.2fm lane=%.3f gpm_mae=%.1f hdpm_mae=%.1f hhpm_mae=%.1f "
-        "imin=%.2fm item=%.3f skill=%.3f tal=%.3f%s",
+        "imin=%.2fm item=%.3f skill=%.3f tal=%.3f%s%s",
         epoch,
         total_epochs,
         phase_label,
@@ -484,6 +507,7 @@ def _log_epoch_summary(
         val_stats["skill_acc"],
         val_stats["talent_acc"],
         pro_str,
+        time_str,
     )
 
 
@@ -536,6 +560,10 @@ def train_from_datasets(
     best_loss = float("inf")
     best_score = float("inf")
     best_stage1_score = float("inf")
+    best_epoch: int | None = None
+    best_val_metrics: dict[str, float] | None = None
+    best_stage1_epoch: int | None = None
+    best_stage1_metrics: dict[str, float] | None = None
     best_stage1_path = cfg.checkpoint_dir / "best_stage1.pt"
     best_path = cfg.checkpoint_dir / "best.pt"
     last_path = cfg.checkpoint_dir / "last.pt"
@@ -543,6 +571,7 @@ def train_from_datasets(
     start_epoch = 1
     resume_phase: int | None = None
     ckpt: dict[str, Any] | None = None
+    train_start = time.monotonic()
 
     s1_epochs = _resolve_stage1_epochs(cfg)
 
@@ -578,6 +607,7 @@ def train_from_datasets(
                 scaler.load_state_dict(ckpt["scaler_state_dict"])
 
         for epoch in range(start_epoch, cfg.epochs + 1):
+            t_ep = time.monotonic()
             mix_p = _scheduled_scenario_mix(cfg, epoch)
             train_stats = _run_epoch(
                 model,
@@ -600,11 +630,13 @@ def train_from_datasets(
             )
             val_score = _compute_val_selection_score(val_stats)
             val_stats["val_selection_score"] = val_score
+            ep_sec = time.monotonic() - t_ep
             history.append(
                 {
                     "epoch": epoch,
                     "phase": 0,
                     "scenario_mix": mix_p,
+                    "elapsed_sec": round(ep_sec, 2),
                     "train": train_stats,
                     "val": val_stats,
                 }
@@ -617,10 +649,13 @@ def train_from_datasets(
                 train_stats=train_stats,
                 val_stats=val_stats,
                 val_score=val_score,
+                elapsed_sec=ep_sec,
             )
             if val_score <= best_score:
                 best_score = val_score
                 best_loss = val_stats["loss_total"]
+                best_epoch = epoch
+                best_val_metrics = dict(val_stats)
                 save_checkpoint(best_path, model, spec, epoch, val_stats, phase=0)
 
             save_checkpoint(
@@ -665,6 +700,7 @@ def train_from_datasets(
                     scaler1.load_state_dict(ckpt["scaler_state_dict"])
 
             for epoch in range(start_epoch, s1_epochs + 1):
+                t_ep = time.monotonic()
                 train_stats = _run_epoch(
                     model,
                     train_loader,
@@ -682,11 +718,13 @@ def train_from_datasets(
                 )
                 s1_score = compute_stage1_val_score(val_stats)
                 val_stats["val_selection_score"] = s1_score
+                ep_sec = time.monotonic() - t_ep
                 history.append(
                     {
                         "epoch": epoch,
                         "phase": 1,
                         "scenario_mix": 0.0,
+                        "elapsed_sec": round(ep_sec, 2),
                         "train": train_stats,
                         "val": val_stats,
                     }
@@ -699,9 +737,12 @@ def train_from_datasets(
                     train_stats=train_stats,
                     val_stats=val_stats,
                     val_score=s1_score,
+                    elapsed_sec=ep_sec,
                 )
                 if s1_score <= best_stage1_score:
                     best_stage1_score = s1_score
+                    best_stage1_epoch = epoch
+                    best_stage1_metrics = dict(val_stats)
                     save_checkpoint(
                         best_stage1_path,
                         model,
@@ -737,6 +778,8 @@ def train_from_datasets(
             if entering_phase2_fresh and best_stage1_path.exists():
                 s1_ckpt = torch.load(best_stage1_path, map_location="cpu", weights_only=False)
                 model.load_state_dict(s1_ckpt["model_state_dict"], strict=True)
+                best_stage1_epoch = int(s1_ckpt.get("epoch", best_stage1_epoch or 0)) or None
+                best_stage1_metrics = dict(s1_ckpt.get("metrics") or {}) or best_stage1_metrics
                 logger.info(
                     "Loaded best Phase-1 Stage-1 checkpoint (epoch=%s, s1_score=%.4f) before Phase 2 freeze",
                     s1_ckpt.get("epoch"),
@@ -763,6 +806,7 @@ def train_from_datasets(
                     scaler2.load_state_dict(ckpt["scaler_state_dict"])
 
             for epoch in range(s2_start, cfg.epochs + 1):
+                t_ep = time.monotonic()
                 phase2_ep = epoch - s1_epochs
                 mix_p = _scheduled_scenario_mix(cfg, phase2_ep, total_phase_epochs=s2_total_epochs)
                 train_stats = _run_epoch(
@@ -792,11 +836,13 @@ def train_from_datasets(
                 )
                 val_score = compute_stage2_val_score(val_stats)
                 val_stats["val_selection_score"] = val_score
+                ep_sec = time.monotonic() - t_ep
                 history.append(
                     {
                         "epoch": epoch,
                         "phase": 2,
                         "scenario_mix": mix_p,
+                        "elapsed_sec": round(ep_sec, 2),
                         "train": train_stats,
                         "val": val_stats,
                     }
@@ -809,10 +855,13 @@ def train_from_datasets(
                     train_stats=train_stats,
                     val_stats=val_stats,
                     val_score=val_score,
+                    elapsed_sec=ep_sec,
                 )
                 if val_score <= best_score:
                     best_score = val_score
                     best_loss = val_stats["loss_total"]
+                    best_epoch = epoch
+                    best_val_metrics = dict(val_stats)
                     save_checkpoint(
                         best_path,
                         model,
@@ -844,7 +893,18 @@ def train_from_datasets(
 
     model.set_stage1_frozen(False)
     if not best_path.exists() and history:
-        save_checkpoint(best_path, model, spec, history[-1]["epoch"], history[-1]["val"])
+        best_epoch = int(history[-1]["epoch"])
+        best_val_metrics = dict(history[-1]["val"])
+        save_checkpoint(best_path, model, spec, best_epoch, best_val_metrics)
+    elif best_path.exists() and best_epoch is None:
+        b_ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
+        best_epoch = int(b_ckpt.get("epoch", 0)) or None
+        best_val_metrics = dict(b_ckpt.get("metrics") or {}) or None
+
+    if best_stage1_path.exists() and best_stage1_epoch is None:
+        s1_ckpt = torch.load(best_stage1_path, map_location="cpu", weights_only=True)
+        best_stage1_epoch = int(s1_ckpt.get("epoch", 0)) or None
+        best_stage1_metrics = dict(s1_ckpt.get("metrics") or {}) or None
 
     result: dict[str, Any] = {
         "best_checkpoint": best_path,
@@ -853,6 +913,11 @@ def train_from_datasets(
         "model_config_path": cfg.checkpoint_dir / "model_config.json",
         "history": history,
         "spec": spec,
+        "best_epoch": best_epoch,
+        "best_val_metrics": best_val_metrics,
+        "best_stage1_epoch": best_stage1_epoch,
+        "best_stage1_metrics": best_stage1_metrics,
+        "train_elapsed_sec": round(time.monotonic() - train_start, 2),
     }
     if best_stage1_path.exists():
         result["best_stage1_checkpoint"] = best_stage1_path
@@ -905,6 +970,7 @@ def train_from_shards(
     """Stream v2 Parquet shards directly into compact tensors and train D2OracleModel."""
     if not shard_paths:
         raise RuntimeError("No Parquet shards provided for training.")
+    t_ds = time.monotonic()
     vidx = VocabIndex(vocab)
     bundle = build_streaming_datasets(
         shard_paths,
@@ -915,24 +981,43 @@ def train_from_shards(
         pro_sample_weight=cfg.pro_sample_weight,
         pro_val_min_count=cfg.pro_val_min_count,
     )
+    ds_sec = round(time.monotonic() - t_ds, 2)
     if bundle.zero_talent_tiers:
         logger.info(
             "Inferred aid=0 talent recovery rules (train-only) for %d heroes (%d tiers)",
             len(bundle.zero_talent_tiers),
             sum(len(t) for t in bundle.zero_talent_tiers.values()),
         )
+    patch_name = str((manifest or {}).get("game_version_name", vidx.gv_name))
+    gv_id = int((manifest or {}).get("game_version_id", vidx.gv_id))
+    n_val = len(bundle.val_ds) if bundle.val_ds is not None else 0
     logger.info(
-        "Streamed %d unique matches on patch %s (gv=%s, pro=%d, ranked=%d): train=%d val=%d",
+        "Streamed %d unique matches on patch %s (gv=%s, pro=%d, ranked=%d): train=%d val=%d in %.1fs",
         bundle.num_total,
-        (manifest or {}).get("game_version_name", vidx.gv_name),
-        (manifest or {}).get("game_version_id", vidx.gv_id),
+        patch_name,
+        gv_id,
         bundle.num_pro,
         bundle.num_total - bundle.num_pro,
         len(bundle.train_ds),
-        len(bundle.val_ds) if bundle.val_ds is not None else 0,
+        n_val,
+        ds_sec,
     )
     out = train_from_datasets(bundle.train_ds, bundle.val_ds, vocab, cfg, vidx=vidx)
     out["sample_match"] = bundle.sample_match
+    out["val_ds"] = bundle.val_ds
+    out["dataset_summary"] = {
+        "patch": patch_name,
+        "game_version_id": gv_id,
+        "num_shards": len(shard_paths),
+        "num_total": bundle.num_total,
+        "num_pro": bundle.num_pro,
+        "num_ranked": bundle.num_total - bundle.num_pro,
+        "num_train": len(bundle.train_ds),
+        "num_val": n_val,
+        "zero_talent_tiers_heroes": len(bundle.zero_talent_tiers),
+        "zero_talent_tiers_count": sum(len(t) for t in bundle.zero_talent_tiers.values()),
+        "dataset_build_sec": ds_sec,
+    }
     return out
 
 
@@ -962,6 +1047,7 @@ def cli(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
     )
     cfg = TrainingConfig(
         hf_repo_id=args.repo_id,
