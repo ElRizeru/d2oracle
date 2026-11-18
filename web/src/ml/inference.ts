@@ -25,7 +25,8 @@ import {
 import { configureOrtEnvironment, normalizeModelBaseUrl } from "./ortSetup";
 
 export const EXPECTED_MODEL_SCHEMA_VERSION = 2;
-export const EXPECTED_ENCODER_ARCH_VERSION = 3;
+export const EXPECTED_ENCODER_ARCH_VERSION = 4;
+export const SUPPORTED_ENCODER_ARCH_VERSIONS = new Set<number>([3, 4]);
 export const EXPECTED_PARQUET_SCHEMA_VERSION = 2;
 export const EXPECTED_VOCAB_SCHEMA_VERSION = 2;
 
@@ -74,9 +75,12 @@ export function validateBundleMetadata(
       `Incompatible model bundle version (${String(modelConfig.model_schema_version ?? 1)}); expected v${EXPECTED_MODEL_SCHEMA_VERSION}. Reload with updated v2 patch bundle files.`,
     );
   }
-  if (modelConfig.encoder_arch_version !== EXPECTED_ENCODER_ARCH_VERSION) {
+  if (
+    typeof modelConfig.encoder_arch_version !== "number" ||
+    !SUPPORTED_ENCODER_ARCH_VERSIONS.has(modelConfig.encoder_arch_version)
+  ) {
     throw new Error(
-      `Incompatible encoder architecture version (${String(modelConfig.encoder_arch_version)}); expected v${EXPECTED_ENCODER_ARCH_VERSION}. Reload with updated v2 patch bundle files.`,
+      `Incompatible encoder architecture version (${String(modelConfig.encoder_arch_version)}); expected v3 or v${EXPECTED_ENCODER_ARCH_VERSION}. Reload with updated v2 patch bundle files.`,
     );
   }
   if (modelConfig.parquet_schema_version !== EXPECTED_PARQUET_SCHEMA_VERSION) {
@@ -257,7 +261,7 @@ export async function predictDraft(
 
   const maxSteps = Math.max(1, bundle.modelConfig.max_item_len - 1);
   const eosPenalty = bundle.modelConfig.eos_logit_penalty ?? 0;
-  const eosStopProb = bundle.modelConfig.eos_stop_prob ?? 0.48;
+  const eosStopProb = bundle.modelConfig.eos_stop_prob ?? 0.25;
   const maxMinute = matchPace > 0 ? matchPace : null;
   const decodedItemsPerSlot = await decodeItemsGreedy(
     decoderRunner,

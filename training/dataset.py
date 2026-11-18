@@ -19,6 +19,7 @@ from torch.utils.data import Dataset
 
 from shared.constants import (
     ATTRIBUTE_BONUS_ABILITY_ID,
+    LANE_OUTCOME_5_TO_ID,
     LANE_OUTCOME_TO_ID,
     MISSING_STAT_SENTINEL,
     PARQUET_ARROW_SCHEMA,
@@ -36,6 +37,19 @@ PAD_ITEM_ID = 0
 BOS_ITEM_ID = 1
 EOS_ITEM_ID = 2
 TALENT_TIERS: tuple[str, ...] = ("10", "15", "20", "25")
+STAGE1_BATCH_KEYS: tuple[str, ...] = (
+    "hero_idx",
+    "is_radiant",
+    "pos_idx",
+    "radiant_win",
+    "duration_min",
+    "lane_targets",
+    "lane5_targets",
+    "lead10_targets",
+    "lead10_mask",
+    "sample_weight",
+    "is_pro_meta",
+)
 
 REQUIRED_PARQUET_COLUMNS: tuple[str, ...] = tuple(PARQUET_ARROW_SCHEMA.names)
 TRAINING_PARQUET_COLUMNS: tuple[str, ...] = (
@@ -499,6 +513,7 @@ def _allocate_dataset_tensors(n: int, max_item_len: int) -> dict[str, torch.Tens
         "radiant_win": torch.zeros((n,), dtype=torch.float32),
         "duration_min": torch.zeros((n,), dtype=torch.float32),
         "lane_targets": torch.full((n, 3), IGNORE_INDEX, dtype=torch.long),
+        "lane5_targets": torch.full((n, 3), IGNORE_INDEX, dtype=torch.long),
         "lead10_targets": torch.zeros((n, 2), dtype=torch.float32),
         "lead10_mask": torch.zeros((n, 2), dtype=torch.float32),
         "combat_rates": torch.zeros((n, 10, 4), dtype=torch.float32),
@@ -670,12 +685,17 @@ def _encode_match_row_into_arrays(
     arrays["duration_min"][idx] = dur_min
 
     lane_targets = arrays["lane_targets"]
+    lane5_targets = arrays["lane5_targets"]
     for lane_idx, col in enumerate(_LANE_COLS):
         raw_outcome = row.get(col)
         if raw_outcome is not None:
-            mapped = LANE_OUTCOME_TO_ID.get(str(raw_outcome))
+            raw_s = str(raw_outcome)
+            mapped = LANE_OUTCOME_TO_ID.get(raw_s)
             if mapped is not None:
                 lane_targets[idx, lane_idx] = mapped
+            mapped5 = LANE_OUTCOME_5_TO_ID.get(raw_s)
+            if mapped5 is not None:
+                lane5_targets[idx, lane_idx] = mapped5
 
     lead10_targets = arrays["lead10_targets"]
     lead10_mask = arrays["lead10_mask"]
@@ -869,16 +889,23 @@ class DotaDraftDataset(Dataset[dict[str, torch.Tensor]]):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return {k: tensor[idx] for k, tensor in self._tensors.items()}
 
-    def get_batch(self, indices: torch.Tensor | Sequence[int] | slice) -> dict[str, torch.Tensor]:
-        """Gather a whole mini-batch directly from pre-allocated tensors in one vectorized step."""
-        return {k: tensor[indices] for k, tensor in self._tensors.items()}
+    def get_batch(
+        self,
+        indices: torch.Tensor | Sequence[int] | slice,
+        *,
+        keys: Sequence[str] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Gather a mini-batch directly from pre-allocated tensors (optionally pruned to keys)."""
+        if keys is None:
+            return {k: tensor[indices] for k, tensor in self._tensors.items()}
+        return {k: self._tensors[k][indices] for k in keys if k in self._tensors}
 
 
 class TensorBatchLoader:
     """Fast iterable batch sampler directly slicing DotaDraftDataset pre-allocated tensors.
 
-    Eliminates per-row Python __getitem__ + default_collate overhead while preserving exact
-    deterministic permutation semantics when shuffle=True.
+    Supports stage-scoped key pruning (skipping unused Stage-2 tensors in Phase 1) and
+    automatic GPU caching when CUDA free memory comfortably accommodates the sliced keys.
     """
 
     def __init__(
@@ -889,6 +916,8 @@ class TensorBatchLoader:
         shuffle: bool = False,
         drop_last: bool = False,
         seed: int = 42,
+        keys: Sequence[str] | None = None,
+        device: torch.device | str | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
@@ -898,6 +927,34 @@ class TensorBatchLoader:
         self.drop_last = bool(drop_last)
         self._rng = torch.Generator()
         self._rng.manual_seed(int(seed))
+        self._keys: tuple[str, ...] = (
+            tuple(k for k in keys if k in dataset._tensors)
+            if keys is not None
+            else tuple(dataset._tensors.keys())
+        )
+        self._source_tensors: dict[str, torch.Tensor] = {
+            k: dataset._tensors[k] for k in self._keys
+        }
+        self._device = torch.device(device) if device is not None else torch.device("cpu")
+        if self._device.type == "cuda" and len(dataset) > 0:
+            total_bytes = sum(t.numel() * t.element_size() for t in self._source_tensors.values())
+            try:
+                free_mem, _ = torch.cuda.mem_get_info(self._device)
+            except RuntimeError:
+                free_mem = 0
+            budget = min(4 * 1024**3, int(free_mem * 0.45)) if free_mem > 0 else 0
+            if 0 < total_bytes <= budget:
+                self._source_tensors = {
+                    k: t.to(self._device) for k, t in self._source_tensors.items()
+                }
+            else:
+                self._device = torch.device("cpu")
+        else:
+            self._device = torch.device("cpu")
+
+    def release(self) -> None:
+        """Drop any cached GPU tensor references cleanly."""
+        self._source_tensors = {}
 
     def __len__(self) -> int:
         n = len(self.dataset)
@@ -913,13 +970,18 @@ class TensorBatchLoader:
             return
         bs = self.batch_size
         limit = (n // bs) * bs if self.drop_last else n
+        src = self._source_tensors or {k: self.dataset._tensors[k] for k in self._keys}
         if self.shuffle:
             perm = torch.randperm(n, generator=self._rng)
+            if self._device.type == "cuda":
+                perm = perm.to(self._device)
             for start in range(0, limit, bs):
-                yield self.dataset.get_batch(perm[start : min(start + bs, limit)])
+                idx = perm[start : min(start + bs, limit)]
+                yield {k: t[idx] for k, t in src.items()}
         else:
             for start in range(0, limit, bs):
-                yield self.dataset.get_batch(slice(start, min(start + bs, limit)))
+                sl = slice(start, min(start + bs, limit))
+                yield {k: t[sl] for k, t in src.items()}
 
 
 @dataclass

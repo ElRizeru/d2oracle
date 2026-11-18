@@ -9,7 +9,7 @@ from typing import Any
 from shared.constants import PARQUET_SCHEMA_VERSION, VOCAB_SCHEMA_VERSION
 
 MODEL_SCHEMA_VERSION = 2
-ENCODER_ARCH_VERSION = 3
+ENCODER_ARCH_VERSION = 4
 
 # Normalization scales used by Stage-1/Stage-2 heads, scenario conditioning, and losses.
 DURATION_CENTER_MIN = 35.0
@@ -74,24 +74,30 @@ class TrainingConfig:
     # Transformer architecture
     d_model: int = 192
     nhead: int = 6
-    num_encoder_layers: int = 4
+    num_encoder_layers: int = 2
+    stage2_num_layers: int = 2
     num_decoder_layers: int = 2
-    dim_feedforward: int = 512
+    dim_feedforward: int = 384
     dropout: float = 0.1
     max_item_len: int = 12  # <BOS> + up to 11 items / <EOS>
-    stage1_pair_dim: int = 24
+    stage1_pair_dim: int = 20
     stage1_pair_dropout: float = 0.25
+    fm_l2_weight: float = 2e-4
+    stage1_win_trunk_scale: float = 0.0
     use_stage2_block: bool = True
     eos_logit_penalty: float = 0.0
-    eos_stop_prob: float = 0.48
+    eos_stop_prob: float = 0.25
 
     # Optimization & two-phase curriculum
     batch_size: int = 64
     epochs: int = 20
     two_phase: bool = True
     stage1_epochs: int | None = None
+    stage1_patience: int = 3
+    fit_win_temperature: bool = True
     lr: float = 3e-4
     stage1_lr: float | None = None
+    fm_lr: float | None = None
     stage2_lr: float | None = None
     weight_decay: float = 2e-2
     warmup_ratio: float = 0.05
@@ -113,7 +119,7 @@ class TrainingConfig:
     # Per-player weight on losing builds for discrete build heads (item_ce, skill, talent)
     loser_build_weight: float = 0.35
     # Mild label smoothing on win BCE target to reduce early win_head overfitting
-    win_label_smoothing: float = 0.02
+    win_label_smoothing: float = 0.01
 
     # Multi-task loss weights (normalized scales across Stage 1 and Stage 2)
     w_win: float = 2.0
@@ -126,6 +132,7 @@ class TrainingConfig:
     w_item_ce: float = 1.0
     w_item_time: float = 1.5
     w_skill: float = 0.8
+    w_skill_rank_penalty: float = 0.08
     w_talent: float = 0.6
 
     def to_dict(self) -> dict[str, Any]:
@@ -154,11 +161,13 @@ class ModelSpec:
     num_decoder_layers: int
     dim_feedforward: int
     dropout: float
-    stage1_pair_dim: int = 24
+    stage2_num_layers: int = 2
+    stage1_pair_dim: int = 20
     stage1_pair_dropout: float = 0.25
+    stage1_win_trunk_scale: float = 0.0
     use_stage2_block: bool = True
     eos_logit_penalty: float = 0.0
-    eos_stop_prob: float = 0.48
+    eos_stop_prob: float = 0.25
     model_schema_version: int = MODEL_SCHEMA_VERSION
     encoder_arch_version: int = ENCODER_ARCH_VERSION
     parquet_schema_version: int = PARQUET_SCHEMA_VERSION

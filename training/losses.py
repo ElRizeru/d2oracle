@@ -79,13 +79,43 @@ def compute_multitask_loss_tensors(
             torch.clamp(lane_targets, min=0, max=2),
             IGNORE_INDEX,
         )
-        lane_ce = F.cross_entropy(
-            lane_logits.reshape(-1, 3),
-            safe_lanes.reshape(-1),
-            ignore_index=IGNORE_INDEX,
-            reduction="none",
-        ).view(bsz, 3)
-        loss_lanes = _weighted_masked_mean(lane_ce, lane_mask, sample_weight)
+        lane_logits5 = outputs.get("lane_logits5")
+        if lane_logits5 is not None:
+            lane_ce3 = F.nll_loss(
+                lane_logits.reshape(-1, 3),
+                safe_lanes.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).view(bsz, 3)
+        else:
+            lane_ce3 = F.cross_entropy(
+                lane_logits.reshape(-1, 3),
+                safe_lanes.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).view(bsz, 3)
+        loss_lanes = _weighted_masked_mean(lane_ce3, lane_mask, sample_weight)
+
+        lane5_targets = batch.get("lane5_targets")
+        if lane_logits5 is not None and lane5_targets is not None:
+            valid5 = (lane_targets != IGNORE_INDEX) & (lane5_targets != IGNORE_INDEX)
+            safe_lanes5 = torch.where(
+                valid5,
+                torch.clamp(lane5_targets, min=0, max=4),
+                IGNORE_INDEX,
+            )
+            lane_ce5 = F.cross_entropy(
+                lane_logits5.float().reshape(-1, 5),
+                safe_lanes5.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).view(bsz, 3)
+            loss_lane5 = _weighted_masked_mean(lane_ce5, valid5.to(torch.float32), sample_weight)
+            loss_lanes = torch.where(
+                valid5.any(),
+                0.70 * loss_lanes + 0.30 * loss_lane5,
+                loss_lanes,
+            )
 
         lead10_diff = (
             outputs["lead10"].float() - batch["lead10_targets"].float()
@@ -215,6 +245,34 @@ def compute_multitask_loss_tensors(
             reduction="none",
         ).view(bsz, 10, 18)
         loss_skill = _weighted_masked_mean(skill_ce, valid_skills.to(torch.float32), build_weight)
+
+        w_rank_pen = float(getattr(cfg, "w_skill_rank_penalty", 0.0))
+        if w_rank_pen > 0.0:
+            num_cls = skill_logits.shape[-1]
+            act_f = valid_skills.to(torch.float32).unsqueeze(-1)
+            skill_probs = F.softmax(skill_logits, dim=-1) * act_f
+            pred_cum = skill_probs.cumsum(dim=2)
+
+            true_safe = torch.where(valid_skills, skill_targets.clamp(min=0, max=num_cls - 1), 0)
+            true_oh = F.one_hot(true_safe, num_classes=num_cls).to(torch.float32) * act_f
+            true_cum = true_oh.cumsum(dim=2)
+
+            # Level-aware cap [1, 1, 18, 1] maxed with true_cum so hero/facet outliers (Invoker/Wyvern/etc.)
+            # never fight real targets while excess mass on >4-rank basic skills is cleanly penalized.
+            lvl_caps = torch.tensor(
+                [min(4, (lvl + 1) // 2) for lvl in range(1, 19)],
+                device=device,
+                dtype=torch.float32,
+            ).view(1, 1, 18, 1).expand(1, 1, 18, num_cls).clone()
+            if num_cls >= 2:
+                # Attribute Bonus (last class) can reach up to 7 ranks in levels 6..18
+                lvl_caps[..., -1] = 7.0
+            eff_cap = torch.maximum(lvl_caps, true_cum)
+            rank_excess = F.relu(pred_cum - eff_cap).pow(2).sum(dim=-1)  # [B, 10, 18]
+            loss_skill_rank = _weighted_masked_mean(
+                rank_excess, valid_skills.to(torch.float32), build_weight
+            )
+            loss_skill = loss_skill + w_rank_pen * loss_skill_rank
 
         talent_logits = outputs["talent_logits"].float()
         talent_targets = batch["talent_targets"]

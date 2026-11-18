@@ -294,6 +294,7 @@ def collect_validation_diagnostics(
     is_pro_arr = torch.cat(is_pro_l).numpy()
 
     win_cal = _win_calibration_summary(win_probs, win_targets)
+    win_cal["temperature"] = round(float(model.encoder.win_temperature.item()), 4)
     # Also evaluate all pro matches in val_ds separately when pro sample in slice is small
     pro_all_mask = val_ds._tensors["is_pro_meta"].bool().numpy()
     if pro_all_mask.any():
@@ -902,7 +903,7 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
             [
                 "",
                 "## Win Calibration (best checkpoint on val)",
-                f"- All (n={win_cal.get('count')}): AUC={win_cal.get('win_auc')}, Acc={win_cal.get('win_acc')}, Brier={win_cal.get('win_brier')}, LogLoss={win_cal.get('win_logloss')}, ECE={win_cal.get('win_ece')}",
+                f"- All (n={win_cal.get('count')}, T={win_cal.get('temperature', 1.0)}): AUC={win_cal.get('win_auc')}, Acc={win_cal.get('win_acc')}, Brier={win_cal.get('win_brier')}, LogLoss={win_cal.get('win_logloss')}, ECE={win_cal.get('win_ece')}",
             ]
         )
         if "pro" in win_cal:

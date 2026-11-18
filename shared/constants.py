@@ -41,6 +41,13 @@ LANE_OUTCOME_TO_ID: dict[str, int] = {
     "DIRE_STOMP": 2,
 }
 LANE_OUTCOME_LABELS: tuple[str, ...] = ("RADIANT_WIN", "EVEN", "DIRE_WIN")
+LANE_OUTCOME_5_TO_ID: dict[str, int] = {
+    "RADIANT_STOMP": 0,
+    "RADIANT_VICTORY": 1,
+    "TIE": 2,
+    "DIRE_VICTORY": 3,
+    "DIRE_STOMP": 4,
+}
 
 VOCAB_SCHEMA_VERSION = 2
 PARQUET_SCHEMA_VERSION = 2

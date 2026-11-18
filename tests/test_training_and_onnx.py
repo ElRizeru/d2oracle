@@ -31,6 +31,7 @@ from training.dataset import (
     EOS_ITEM_ID,
     IGNORE_INDEX,
     PAD_ITEM_ID,
+    STAGE1_BATCH_KEYS,
     DotaDraftDataset,
     TensorBatchLoader,
     VocabIndex,
@@ -59,6 +60,7 @@ from training.train import (
     build_model_spec,
     compute_stage1_val_score,
     compute_stage2_val_score,
+    fit_win_temperature,
     train_from_datasets,
     train_from_rows,
     train_from_shards,
@@ -403,9 +405,8 @@ def test_encoder_twostage_invariants_and_gradient_isolation(
         + full["talent_logits"].sum()
     )
     stage2_only_loss.backward()
-    for s1_mod in (enc.win_head, enc.duration_head, enc.lane_head, enc.lead10_head):
-        for p in s1_mod.parameters():
-            assert p.grad is None or torch.all(p.grad == 0)
+    for p in enc.stage1_parameters():
+        assert p.grad is None or torch.all(p.grad == 0)
 
 
 def test_multitask_loss_all_masked_targets_no_nan(sample_vocab: dict[str, Any]) -> None:
@@ -509,9 +510,10 @@ def test_real_patch_vocab_export_parity_and_payload_budget_if_present(tmp_path: 
     cfg = TrainingConfig(
         d_model=192,
         nhead=6,
-        num_encoder_layers=4,
+        num_encoder_layers=2,
+        stage2_num_layers=2,
         num_decoder_layers=2,
-        dim_feedforward=512,
+        dim_feedforward=384,
         dropout=0.0,
         max_item_len=12,
     )
@@ -1771,7 +1773,7 @@ def test_stage1_pairwise_symmetry_freeze_isolation_and_two_phase_resume(
     model = D2OracleModel(spec, vidx.build_skill_mask())
     model.eval()
 
-    # Check pairwise prior team antisymmetry and <PAD> masking (hero_idx == 0)
+    # Check BilinearFM + full Stage-1 side-equivariance under Radiant<->Dire team swap & <PAD> masking
     hero_a = torch.tensor([[1, 2, 1, 2, 0, 2, 1, 2, 0, 1]], dtype=torch.long)
     rad_a = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.long)
     pos_a = torch.tensor([[0, 1, 2, 3, 4, 0, 1, 2, 3, 4]], dtype=torch.long)
@@ -1781,12 +1783,20 @@ def test_stage1_pairwise_symmetry_freeze_isolation_and_two_phase_resume(
     pos_b = torch.cat([pos_a[:, 5:], pos_a[:, :5]], dim=1)
 
     with torch.no_grad():
-        torch.nn.init.normal_(model.encoder.hero_pos_win_bias.weight, std=0.5)
-        hp_a = model.encoder.hero_emb(hero_a) + model.encoder.pos_emb(pos_a)
-        hp_b = model.encoder.hero_emb(hero_b) + model.encoder.pos_emb(pos_b)
-        p_a = model.encoder._compute_pairwise_win_prior(hero_a, rad_a, pos_a, hp_a)
-        p_b = model.encoder._compute_pairwise_win_prior(hero_b, rad_b, pos_b, hp_b)
-    assert torch.allclose(p_a, -p_b, atol=1e-5)
+        torch.nn.init.normal_(model.encoder.fm_h_bias.weight, std=0.4)
+        torch.nn.init.normal_(model.encoder.fm_hp_bias.weight, std=0.4)
+        p_a = model.encoder.compute_fm_win_logit(hero_a, rad_a, pos_a, include_map_bias=False)
+        p_b = model.encoder.compute_fm_win_logit(hero_b, rad_b, pos_b, include_map_bias=False)
+        assert torch.allclose(p_a, -p_b, atol=1e-5)
+
+        s1_a = model.forward_stage1(hero_a, rad_a, pos_a)
+        s1_b = model.forward_stage1(hero_b, rad_b, pos_b)
+        assert torch.allclose(s1_a["duration_quantiles"], s1_b["duration_quantiles"], atol=1e-5)
+        assert torch.allclose(s1_a["lead10"], -s1_b["lead10"], atol=1e-4)
+        # Swapping teams mirrors Top<->Bot lanes and flips Rad<->Dire classes [2, 1, 0]
+        assert torch.allclose(s1_b["lane_probs"][:, 0], s1_a["lane_probs"][:, 2, [2, 1, 0]], atol=1e-5)
+        assert torch.allclose(s1_b["lane_probs"][:, 1], s1_a["lane_probs"][:, 1, [2, 1, 0]], atol=1e-5)
+        assert torch.allclose(s1_b["lane_probs"][:, 2], s1_a["lane_probs"][:, 0, [2, 1, 0]], atol=1e-5)
 
     # Check Stage-1 freeze isolation during a Phase-2 optimizer step
     model.set_stage1_frozen(True)
@@ -1794,7 +1804,8 @@ def test_stage1_pairwise_symmetry_freeze_isolation_and_two_phase_resume(
         assert mod.training is False
         for param in mod.parameters():
             assert param.requires_grad is False
-    assert model.encoder.cls_token.requires_grad is False
+    for param in model.encoder.stage1_parameters():
+        assert param.requires_grad is False
 
     with torch.no_grad():
         s1_before = {
@@ -1827,6 +1838,8 @@ def test_stage1_pairwise_symmetry_freeze_isolation_and_two_phase_resume(
     loss2, _ = compute_multitask_loss(out2, batch, cfg, stage_mode="stage2")
     loss2.backward()
     assert model.encoder.hero_emb.weight.grad is None
+    assert model.encoder.s2_hero_emb.weight.grad is not None
+    assert model.encoder.stage2_layers[0].norm1.weight.grad is not None
     assert model.encoder.combat_rate_head[-1].bias.grad is not None
     assert float(model.encoder.combat_rate_head[-1].bias.grad[3].abs().item()) > 0.0
     assert model.item_decoder.minute_head[-1].bias.grad is not None
@@ -2004,3 +2017,142 @@ def test_fully_masked_branchless_loss_and_diagnostics_bundle(
         "model_config.json",
         "vocab.json",
     ]
+
+
+def test_v4_ordinal_lane5_targets_and_skill_rank_penalty(
+    tmp_path: Path, sample_vocab: dict[str, Any]
+) -> None:
+    vidx = VocabIndex(sample_vocab)
+    rows = []
+    outcomes = ("RADIANT_STOMP", "RADIANT_VICTORY", "TIE", "DIRE_VICTORY", "DIRE_STOMP")
+    for i in range(5):
+        r = _make_training_row(match_id=98000 + i, start_datetime=1794700000 + i * 60)
+        r["top_lane_outcome"] = outcomes[i]
+        r["mid_lane_outcome"] = outcomes[(i + 1) % 5]
+        r["bottom_lane_outcome"] = outcomes[(i + 2) % 5]
+        rows.append(r)
+
+    ds = DotaDraftDataset(rows, vidx, max_item_len=8)
+    assert ds._tensors["lane5_targets"][0].tolist() == [0, 1, 2]
+    assert ds._tensors["lane5_targets"][3].tolist() == [3, 4, 0]
+
+    cfg_no_pen = TrainingConfig(
+        checkpoint_dir=tmp_path / "ckpt",
+        data_dir=tmp_path / "data",
+        export_dir=tmp_path / "export",
+        d_model=32,
+        nhead=4,
+        num_encoder_layers=1,
+        stage2_num_layers=1,
+        num_decoder_layers=1,
+        dim_feedforward=64,
+        max_item_len=8,
+        w_skill_rank_penalty=0.0,
+        use_amp=False,
+    )
+    cfg_with_pen = copy.deepcopy(cfg_no_pen)
+    cfg_with_pen.w_skill_rank_penalty = 0.2
+
+    batch = next(iter(TensorBatchLoader(ds, batch_size=5, shuffle=False)))
+    spec = build_model_spec(vidx, cfg_with_pen)
+    model = D2OracleModel(spec, vidx.build_skill_mask())
+    model.eval()
+    with torch.no_grad():
+        out = model(
+            batch["hero_idx"],
+            batch["is_radiant"],
+            batch["pos_idx"],
+            batch["item_input_ids"],
+        )
+        # Force skill logits to strongly violate cumulative rank caps by spamming skill slot 0 on every level
+        violating = {k: v.clone() for k, v in out.items()}
+        violating["skill_logits"] = torch.full_like(out["skill_logits"], -20.0)
+        violating["skill_logits"][:, :, :, 0] = 20.0
+
+    _, sc_base = compute_multitask_loss(violating, batch, cfg_no_pen, stage_mode="all")
+    _, sc_pen = compute_multitask_loss(violating, batch, cfg_with_pen, stage_mode="all")
+    assert sc_pen["loss_skill"] > sc_base["loss_skill"] + 1.0
+
+
+def test_v4_stage1_early_stop_temperature_cal_and_loader_keys(
+    tmp_path: Path, sample_vocab: dict[str, Any]
+) -> None:
+    vidx = VocabIndex(sample_vocab)
+    rows = [
+        _make_training_row(
+            match_id=99500 + i,
+            start_datetime=1794710000 + i * 60,
+            radiant_win=(i % 2 == 0),
+        )
+        for i in range(96)
+    ]
+    ds = DotaDraftDataset(rows, vidx, max_item_len=8)
+    s1_loader = TensorBatchLoader(ds, batch_size=32, shuffle=False, keys=STAGE1_BATCH_KEYS)
+    first_b = next(iter(s1_loader))
+    assert set(first_b.keys()) == set(STAGE1_BATCH_KEYS)
+    assert "item_input_ids" not in first_b
+
+    cfg = TrainingConfig(
+        checkpoint_dir=tmp_path / "ckpt_cal",
+        data_dir=tmp_path / "data",
+        export_dir=tmp_path / "exp_cal",
+        d_model=32,
+        nhead=4,
+        num_encoder_layers=1,
+        stage2_num_layers=1,
+        num_decoder_layers=1,
+        dim_feedforward=64,
+        max_item_len=8,
+        batch_size=32,
+        epochs=2,
+        two_phase=False,
+        fit_win_temperature=True,
+        use_amp=False,
+        resume=False,
+    )
+    spec = build_model_spec(vidx, cfg)
+    model = D2OracleModel(spec, vidx.build_skill_mask())
+    # Force strong overconfident logits (+4.0) against 50/50 targets -> optimal calibration T > 1.5
+    with torch.no_grad():
+        model.encoder.rad_win_bias.fill_(4.0)
+        model.encoder.win_temperature.fill_(1.0)
+
+    fitted_t = fit_win_temperature(model, s1_loader, torch.device("cpu"), min_samples=64)
+    assert fitted_t > 1.5
+    assert float(model.encoder.win_temperature.item()) == pytest.approx(fitted_t, abs=1e-6)
+
+    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = cfg.checkpoint_dir / "cal_ckpt.pt"
+    (cfg.checkpoint_dir / "vocab.json").write_text(json.dumps(sample_vocab), encoding="utf-8")
+    torch.save({"epoch": 1, "spec": spec.to_dict(), "model_state_dict": model.state_dict()}, ckpt_path)
+    export_to_onnx(ckpt_path, cfg.export_dir)
+    parity = verify_onnx_parity(ckpt_path, cfg.export_dir, atol=1e-4)
+    assert parity["passed"] is True
+
+    # Also verify Phase-1 early stopping works cleanly & transitions to Phase 2 with consistent epochs
+    cfg_es = TrainingConfig(
+        checkpoint_dir=tmp_path / "ckpt_es",
+        data_dir=tmp_path / "data",
+        export_dir=tmp_path / "exp_es",
+        d_model=32,
+        nhead=4,
+        num_encoder_layers=1,
+        stage2_num_layers=1,
+        num_decoder_layers=1,
+        dim_feedforward=64,
+        max_item_len=8,
+        batch_size=32,
+        epochs=10,
+        two_phase=True,
+        stage1_epochs=8,
+        stage1_patience=3,
+        fit_win_temperature=True,
+        lr=1e-2,  # high LR on tiny 80-row constant dataset converges immediately then plateaus
+        use_amp=False,
+        resume=False,
+    )
+    train_rows, val_rows = split_rows_train_val(rows, val_split=0.2, seed=42)
+    res_es = train_from_rows(train_rows, val_rows, sample_vocab, cfg_es)
+    assert len(res_es["history"]) == 10
+    assert [h["epoch"] for h in res_es["history"]] == list(range(1, 11))
+    assert res_es["history"][-1]["phase"] == 2

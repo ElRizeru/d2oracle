@@ -84,9 +84,9 @@ class TransformerEncoderBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None = None) -> torch.Tensor:
         h = self.norm1(x)
-        x = x + self.drop1(self.self_attn(h, h, h))
+        x = x + self.drop1(self.self_attn(h, h, h, attn_bias=attn_bias))
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -213,7 +213,7 @@ class CausalSkillHead(nn.Module):
 
 
 class D2OracleEncoder(nn.Module):
-    """Two-stage draft encoder: Stage 1 predicts win/duration/lanes/@10m, Stage 2 predicts hero stats/builds."""
+    """Two-stage draft encoder: side-equivariant Stage 1 + BilinearFM, dedicated Stage 2."""
 
     SCENARIO_DIM = 16  # own_win(1) + dur_norm(1) + own_lanes(9) + own_lead10_norm(2) + own_slot_lane(3)
 
@@ -225,24 +225,31 @@ class D2OracleEncoder(nn.Module):
         stage1_drop = min(0.35, spec.dropout * 1.5) if spec.dropout > 0.0 else 0.0
         pair_drop = float(spec.stage1_pair_dropout) if spec.dropout > 0.0 else 0.0
 
+        # ---- Stage 1 side-equivariant backbone (no team_emb; relative attention bias instead) ----
         self.hero_emb = nn.Embedding(spec.num_heroes + 1, d)
-        self.team_emb = nn.Embedding(2, d)
         self.pos_emb = nn.Embedding(5, d)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d))
         nn.init.normal_(self.cls_token, std=0.02)
 
-        self.emb_drop = nn.Dropout(spec.dropout)
+        self.s1_same_team_bias = nn.Parameter(torch.zeros(1, spec.nhead, 1, 1))
+        self.s1_opp_team_bias = nn.Parameter(torch.zeros(1, spec.nhead, 1, 1))
+        self.s1_self_bias = nn.Parameter(torch.zeros(1, spec.nhead, 1, 1))
+        self.s1_cls_self_bias = nn.Parameter(torch.zeros(1, spec.nhead, 1, 1))
+        self.s1_cls_to_slot_bias = nn.Parameter(torch.zeros(1, spec.nhead, 1, 1))
+        self.s1_slot_to_cls_bias = nn.Parameter(torch.zeros(1, spec.nhead, 1, 1))
+
+        self.emb_drop = nn.Dropout(stage1_drop)
         self.layers = nn.ModuleList(
             [
                 TransformerEncoderBlock(
-                    d, spec.nhead, spec.dim_feedforward, dropout=spec.dropout
+                    d, spec.nhead, spec.dim_feedforward, dropout=stage1_drop
                 )
                 for _ in range(spec.num_encoder_layers)
             ]
         )
         self.final_norm = nn.LayerNorm(d)
 
-        # ONNX-safe role lookup matrix for pooling per-team position embeddings
+        # ONNX-safe role lookup matrix & symmetry buffers
         self.register_buffer("pos_eye", torch.eye(5, dtype=torch.float32))
         self.register_buffer(
             "pair_off_diag", (1.0 - torch.eye(10, dtype=torch.float32)).unsqueeze(0)
@@ -257,28 +264,43 @@ class D2OracleEncoder(nn.Module):
                 dtype=torch.float32,
             ),
         )
+        # Post-Stage-1 temperature calibration scalar baked into win_prob for ONNX inference parity
+        self.register_buffer("win_temperature", torch.ones(1, dtype=torch.float32))
 
-        # ---- Stage 1 heads (unconditioned match-level outcomes) ----
-        self.win_head = nn.Sequential(
-            nn.Linear(3 * d, d),
-            nn.GELU(),
-            nn.Dropout(stage1_drop),
-            nn.Linear(d, 1),
-        )
+        # ---- Stage 1 heads (standalone BilinearFM for win + symmetric/mirror match heads) ----
         self.pair_dim = int(spec.stage1_pair_dim)
+        self.fm_h_bias = nn.Embedding(spec.num_heroes + 1, 1)
+        self.fm_hp_bias = nn.Embedding((spec.num_heroes + 1) * 5, 1)
+        nn.init.zeros_(self.fm_h_bias.weight)
+        nn.init.zeros_(self.fm_hp_bias.weight)
         if self.pair_dim > 0:
-            self.hero_pos_win_bias = nn.Embedding((spec.num_heroes + 1) * 5, 1)
-            nn.init.zeros_(self.hero_pos_win_bias.weight)
-            self.win_pair_proj = nn.Linear(d, 3 * self.pair_dim)
-            self.pair_drop = nn.Dropout(pair_drop)
-            self.win_pair_head = nn.Linear(3, 1, bias=False)
-            with torch.no_grad():
-                self.win_pair_head.weight.copy_(torch.tensor([[1.0, 0.25, 0.25]]))
+            self.fm_syn = nn.Embedding(spec.num_heroes + 1, self.pair_dim)
+            self.fm_cnt_a = nn.Embedding(spec.num_heroes + 1, self.pair_dim)
+            self.fm_cnt_b = nn.Embedding(spec.num_heroes + 1, self.pair_dim)
+            for fm_emb in (self.fm_syn, self.fm_cnt_a, self.fm_cnt_b):
+                nn.init.normal_(fm_emb.weight, std=0.04)
+            self.fm_drop = nn.Dropout(pair_drop)
+            self.fm_scale = 1.0 / math.sqrt(float(self.pair_dim))
         else:
-            self.hero_pos_win_bias = None
-            self.win_pair_proj = None
-            self.pair_drop = None
-            self.win_pair_head = None
+            self.fm_syn = None
+            self.fm_cnt_a = None
+            self.fm_cnt_b = None
+            self.fm_drop = None
+            self.fm_scale = 1.0
+        self.rad_win_bias = nn.Parameter(torch.zeros(1, 1))
+
+        self.win_trunk_scale = float(spec.stage1_win_trunk_scale)
+        if self.win_trunk_scale > 0.0:
+            self.win_res_mlp = nn.Sequential(
+                nn.Linear(4 * d, 64),
+                nn.GELU(),
+                nn.Dropout(0.4 if spec.dropout > 0.0 else 0.0),
+                nn.Linear(64, 1),
+            )
+            nn.init.zeros_(self.win_res_mlp[-1].weight)
+            nn.init.zeros_(self.win_res_mlp[-1].bias)
+        else:
+            self.win_res_mlp = None
 
         self.duration_head = nn.Sequential(
             nn.Linear(3 * d, d),
@@ -290,15 +312,26 @@ class D2OracleEncoder(nn.Module):
         with torch.no_grad():
             self.duration_head[-1].bias[0] = 23.0  # ~38 min initial median (15 + softplus(23))
 
-        self.match_context_proj = nn.Linear(3 * d, d)
-        self.lane_emb = nn.Embedding(3, d)
-        self.lane_pair_mlp = nn.Sequential(
-            nn.Linear(6 * d, d),
+        # Shared Safelane-vs-Offlane MLP (5 ordinal classes: SafeStomp, SafeWin, Tie, OffWin, OffStomp)
+        self.sidelane_head = nn.Sequential(
+            nn.Linear(7 * d, d),
             nn.GELU(),
             nn.Dropout(stage1_drop),
+            nn.Linear(d, 5),
         )
-        self.lane_head = nn.Linear(d, 3)
-
+        # Antisymmetric advantage (stomp, win) + symmetric spread baseline (stomp, win, tie)
+        self.mid_adv_head = nn.Sequential(
+            nn.Linear(4 * d, d),
+            nn.GELU(),
+            nn.Dropout(stage1_drop),
+            nn.Linear(d, 2),
+        )
+        self.mid_sym_head = nn.Sequential(
+            nn.Linear(3 * d, d // 2),
+            nn.GELU(),
+            nn.Dropout(stage1_drop),
+            nn.Linear(d // 2, 3),
+        )
         self.lead10_head = nn.Sequential(
             nn.Linear(4 * d, d),
             nn.GELU(),
@@ -306,7 +339,19 @@ class D2OracleEncoder(nn.Module):
             nn.Linear(d, 2),
         )
 
-        # ---- Stage 1 -> Stage 2 Scenario Conditioning Bridge ----
+        # ---- Dedicated Stage 2 backbone & Scenario Conditioning Bridge ----
+        self.s2_hero_emb = nn.Embedding(spec.num_heroes + 1, d)
+        self.s2_pos_emb = nn.Embedding(5, d)
+        self.s2_team_emb = nn.Embedding(2, d)
+        self.s2_hp_fuse = nn.Sequential(
+            nn.Linear(3 * d, d),
+            nn.GELU(),
+        )
+        self.s2_in_proj = nn.Sequential(
+            nn.Linear(2 * d, d),
+            nn.LayerNorm(d),
+        )
+
         self.scenario_mlp = nn.Sequential(
             nn.Linear(self.SCENARIO_DIM, d),
             nn.GELU(),
@@ -320,11 +365,16 @@ class D2OracleEncoder(nn.Module):
             nn.Linear(d, d),
         )
         self.stage2_norm = nn.LayerNorm(d)
-        self.stage2_block = (
-            TransformerEncoderBlock(d, spec.nhead, spec.dim_feedforward, dropout=spec.dropout)
-            if spec.use_stage2_block
-            else None
+        n_s2_layers = int(spec.stage2_num_layers) if spec.use_stage2_block else 0
+        self.stage2_layers = nn.ModuleList(
+            [
+                TransformerEncoderBlock(
+                    d, spec.nhead, spec.dim_feedforward, dropout=spec.dropout
+                )
+                for _ in range(n_s2_layers)
+            ]
         )
+        self.stage2_out_norm = nn.LayerNorm(d)
 
         # ---- Stage 2 per-hero heads (conditioned on detached/scheduled Stage-1 scenario) ----
         self.combat_rate_head = nn.Sequential(
@@ -372,38 +422,84 @@ class D2OracleEncoder(nn.Module):
     def _stage1_submodules(self) -> tuple[nn.Module, ...]:
         mods: list[nn.Module] = [
             self.hero_emb,
-            self.team_emb,
             self.pos_emb,
             self.emb_drop,
             self.layers,
             self.final_norm,
-            self.win_head,
+            self.fm_h_bias,
+            self.fm_hp_bias,
             self.duration_head,
-            self.match_context_proj,
-            self.lane_emb,
-            self.lane_pair_mlp,
-            self.lane_head,
+            self.sidelane_head,
+            self.mid_adv_head,
+            self.mid_sym_head,
             self.lead10_head,
         ]
-        if self.pair_dim > 0:
-            assert self.hero_pos_win_bias is not None
-            assert self.win_pair_proj is not None
-            assert self.pair_drop is not None
-            assert self.win_pair_head is not None
-            mods.extend(
-                [
-                    self.hero_pos_win_bias,
-                    self.win_pair_proj,
-                    self.pair_drop,
-                    self.win_pair_head,
-                ]
-            )
+        if self.fm_syn is not None:
+            assert self.fm_cnt_a is not None
+            assert self.fm_cnt_b is not None
+            assert self.fm_drop is not None
+            mods.extend([self.fm_syn, self.fm_cnt_a, self.fm_cnt_b, self.fm_drop])
+        if self.win_res_mlp is not None:
+            mods.append(self.win_res_mlp)
         return tuple(mods)
 
+    def _stage1_raw_parameters(self) -> tuple[nn.Parameter, ...]:
+        return (
+            self.cls_token,
+            self.s1_same_team_bias,
+            self.s1_opp_team_bias,
+            self.s1_self_bias,
+            self.s1_cls_self_bias,
+            self.s1_cls_to_slot_bias,
+            self.s1_slot_to_cls_bias,
+            self.rad_win_bias,
+        )
+
+    def fm_parameters(self) -> list[nn.Parameter]:
+        """Return BilinearFM + Radiant win bias parameters (optimized without AdamW weight_decay)."""
+        params: list[nn.Parameter] = [
+            self.fm_h_bias.weight,
+            self.fm_hp_bias.weight,
+            self.rad_win_bias,
+        ]
+        if self.fm_syn is not None:
+            assert self.fm_cnt_a is not None and self.fm_cnt_b is not None
+            params.extend([self.fm_syn.weight, self.fm_cnt_a.weight, self.fm_cnt_b.weight])
+        return params
+
+    def stage1_parameters(self) -> list[nn.Parameter]:
+        """Return every trainable Parameter belonging to Stage 1."""
+        seen: set[int] = set()
+        out: list[nn.Parameter] = []
+        for p in self._stage1_raw_parameters():
+            if id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
+        for mod in self._stage1_submodules():
+            for p in mod.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    out.append(p)
+        return out
+
+    def fm_l2(self) -> torch.Tensor:
+        """Compute isotropic L2 penalty over BilinearFM active hero embeddings and biases."""
+        reg = self.fm_h_bias.weight[1:].pow(2).sum() + 2.0 * self.fm_hp_bias.weight[5:].pow(2).sum()
+        if self.fm_syn is not None:
+            assert self.fm_cnt_a is not None and self.fm_cnt_b is not None
+            reg = (
+                reg
+                + self.fm_syn.weight[1:].pow(2).sum()
+                + self.fm_cnt_a.weight[1:].pow(2).sum()
+                + self.fm_cnt_b.weight[1:].pow(2).sum()
+            )
+        return reg
+
     def set_stage1_frozen(self, frozen: bool) -> None:
-        """Freeze or unfreeze backbone + Stage-1 heads, keeping frozen Stage-1 in eval mode."""
+        """Freeze or unfreeze Stage-1 backbone & heads, keeping frozen Stage-1 in eval mode."""
         self._stage1_frozen = bool(frozen)
-        self.cls_token.requires_grad_(not frozen)
+        for param in self._stage1_raw_parameters():
+            param.requires_grad_(not frozen)
         for mod in self._stage1_submodules():
             for param in mod.parameters():
                 param.requires_grad_(not frozen)
@@ -417,18 +513,64 @@ class D2OracleEncoder(nn.Module):
                 mod.eval()
         return self
 
-    def _compute_lane_features(
+    def compute_fm_win_logit(
         self,
+        hero_idx: torch.Tensor,
+        is_radiant: torch.Tensor,
+        pos_idx: torch.Tensor,
+        *,
+        include_map_bias: bool = True,
+    ) -> torch.Tensor:
+        """Compute exact team-antisymmetric BilinearFM win logit (+ optional map side bias)."""
+        dtype = torch.float32
+        active = (hero_idx > 0).to(dtype)  # [B, 10]
+        rad_w = is_radiant.to(dtype) * active
+        dire_w = (1.0 - is_radiant.to(dtype)) * active
+        team_sign = rad_w - dire_w
+
+        h_b = self.fm_h_bias(hero_idx).squeeze(-1).to(dtype)
+        hp_b = self.fm_hp_bias(hero_idx * 5 + pos_idx).squeeze(-1).to(dtype)
+        logit = ((h_b + hp_b) * team_sign).sum(dim=1, keepdim=True)
+
+        if self.fm_syn is not None:
+            assert self.fm_cnt_a is not None and self.fm_cnt_b is not None and self.fm_drop is not None
+            act_3d = active.unsqueeze(-1)
+            rw_3d = rad_w.unsqueeze(-1)
+            dw_3d = dire_w.unsqueeze(-1)
+
+            u = self.fm_drop(self.fm_syn(hero_idx).to(dtype)) * act_3d
+            sum_r = (u * rw_3d).sum(dim=1)
+            sq_r = ((u * u) * rw_3d).sum(dim=1)
+            sum_d = (u * dw_3d).sum(dim=1)
+            sq_d = ((u * u) * dw_3d).sum(dim=1)
+            syn = 0.5 * ((sum_r * sum_r - sq_r).sum(dim=1, keepdim=True) - (sum_d * sum_d - sq_d).sum(dim=1, keepdim=True)) * self.fm_scale
+
+            ca = self.fm_drop(self.fm_cnt_a(hero_idx).to(dtype)) * act_3d
+            cb = self.fm_drop(self.fm_cnt_b(hero_idx).to(dtype)) * act_3d
+            ca_r = (ca * rw_3d).sum(dim=1)
+            cb_r = (cb * rw_3d).sum(dim=1)
+            ca_d = (ca * dw_3d).sum(dim=1)
+            cb_d = (cb * dw_3d).sum(dim=1)
+            cnt = ((ca_r * cb_d).sum(dim=1, keepdim=True) - (cb_r * ca_d).sum(dim=1, keepdim=True)) * self.fm_scale
+
+            logit = logit + syn + cnt
+
+        if include_map_bias:
+            logit = logit + self.rad_win_bias.to(dtype)
+        return logit
+
+    def _compute_lane_logits5(
+        self,
+        cls_out: torch.Tensor,
         slot_memory: torch.Tensor,
         is_radiant: torch.Tensor,
         pos_idx: torch.Tensor,
-        match_repr: torch.Tensor,
+        active_w: torch.Tensor,
     ) -> torch.Tensor:
-        """Build [B, 3, d] Top/Mid/Bot matchup features combining pair embeddings & global context."""
-        bsz = slot_memory.shape[0]
-        pos_onehot = self.pos_eye[pos_idx]  # [B, 10, 5]
-        rad_mask = is_radiant.to(slot_memory.dtype).unsqueeze(-1)  # [B, 10, 1]
-        dire_mask = 1.0 - rad_mask
+        """Predict 5-class ordinal lane logits [Top, Mid, Bot] x [RadStomp..DireStomp] cleanly."""
+        pos_onehot = self.pos_eye[pos_idx].to(slot_memory.dtype)  # [B, 10, 5]
+        rad_mask = is_radiant.to(slot_memory.dtype).unsqueeze(-1) * active_w  # [B, 10, 1]
+        dire_mask = (1.0 - is_radiant.to(slot_memory.dtype)).unsqueeze(-1) * active_w
 
         rad_pos_w = pos_onehot * rad_mask
         dire_pos_w = pos_onehot * dire_mask
@@ -439,81 +581,66 @@ class D2OracleEncoder(nn.Module):
             dim=1
         ).clamp(min=1.0).unsqueeze(-1)  # [B, 5, d]
 
-        # Top: Rad pos 3+4 vs Dire pos 1+5
-        top_rad = 0.5 * (rad_by_pos[:, 2, :] + rad_by_pos[:, 3, :])
-        top_dire = 0.5 * (dire_by_pos[:, 0, :] + dire_by_pos[:, 4, :])
-        top_core_diff = rad_by_pos[:, 2, :] - dire_by_pos[:, 0, :]
-        top_supp_diff = rad_by_pos[:, 3, :] - dire_by_pos[:, 4, :]
-
-        # Mid: Rad pos 2 vs Dire pos 2
-        mid_rad = rad_by_pos[:, 1, :]
-        mid_dire = dire_by_pos[:, 1, :]
-        mid_core_diff = mid_rad - mid_dire
-        mid_supp_diff = torch.zeros_like(mid_core_diff)
-
-        # Bot: Rad pos 1+5 vs Dire pos 3+4
-        bot_rad = 0.5 * (rad_by_pos[:, 0, :] + rad_by_pos[:, 4, :])
-        bot_dire = 0.5 * (dire_by_pos[:, 2, :] + dire_by_pos[:, 3, :])
-        bot_core_diff = rad_by_pos[:, 0, :] - dire_by_pos[:, 2, :]
-        bot_supp_diff = rad_by_pos[:, 4, :] - dire_by_pos[:, 3, :]
-
-        match_ctx = F.gelu(self.match_context_proj(match_repr)).unsqueeze(1).expand(bsz, 3, -1)
-        rad_lanes = torch.stack([top_rad, mid_rad, bot_rad], dim=1)
-        dire_lanes = torch.stack([top_dire, mid_dire, bot_dire], dim=1)
-        core_diffs = torch.stack([top_core_diff, mid_core_diff, bot_core_diff], dim=1)
-        supp_diffs = torch.stack([top_supp_diff, mid_supp_diff, bot_supp_diff], dim=1)
-
-        lane_inputs = torch.cat(
-            [match_ctx, rad_lanes, dire_lanes, rad_lanes - dire_lanes, core_diffs, supp_diffs],
+        # Bot lane: Radiant Safe (0, 4) vs Dire Off (2, 3) -> [RadStomp, RadWin, Tie, DireWin, DireStomp]
+        bot_in = torch.cat(
+            [
+                cls_out,
+                rad_by_pos[:, 0, :],
+                rad_by_pos[:, 4, :],
+                dire_by_pos[:, 2, :],
+                dire_by_pos[:, 3, :],
+                rad_by_pos[:, 0, :] - dire_by_pos[:, 2, :],
+                rad_by_pos[:, 4, :] - dire_by_pos[:, 3, :],
+            ],
             dim=-1,
-        )  # [B, 3, 6*d]
-        lane_ids = self.lane_emb.weight.unsqueeze(0).expand(bsz, -1, -1)  # [B, 3, d]
-        return self.lane_pair_mlp(lane_inputs) + lane_ids  # [B, 3, d]
-
-    def _compute_pairwise_win_prior(
-        self,
-        hero_idx: torch.Tensor,
-        is_radiant: torch.Tensor,
-        pos_idx: torch.Tensor,
-        hp_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute antisymmetric (hero, pos) linear prior + low-rank synergy/counter win logit."""
-        if (
-            self.pair_dim <= 0
-            or self.hero_pos_win_bias is None
-            or self.win_pair_proj is None
-            or self.pair_drop is None
-            or self.win_pair_head is None
-        ):
-            return torch.zeros((hero_idx.shape[0], 1), device=hero_idx.device, dtype=torch.float32)
-
-        dtype = hp_emb.dtype
-        active = (hero_idx > 0).to(dtype)  # [B, 10], masks empty <PAD> slots on partial drafts
-        rad_w = is_radiant.to(dtype) * active
-        dire_w = (1.0 - is_radiant.to(dtype)) * active
-
-        flat_hp = hero_idx * 5 + pos_idx
-        hp_bias = self.hero_pos_win_bias(flat_hp).squeeze(-1)  # [B, 10]
-        prior_diff = (hp_bias * (rad_w - dire_w)).sum(dim=1, keepdim=True) * 0.2
-
-        pair_feats = self.pair_drop(self.win_pair_proj(hp_emb)) * active.unsqueeze(-1)
-        u_syn, a_cnt, b_cnt = pair_feats.chunk(3, dim=-1)
-        scale = 1.0 / (math.sqrt(self.pair_dim) * 5.0)
-
-        syn_mat = torch.bmm(u_syn, u_syn.transpose(1, 2))
-        same_team_signed = (
-            torch.bmm(rad_w.unsqueeze(-1), rad_w.unsqueeze(1))
-            - torch.bmm(dire_w.unsqueeze(-1), dire_w.unsqueeze(1))
-        ) * self.pair_off_diag
-        syn_diff = 0.5 * (syn_mat * same_team_signed).sum(dim=(1, 2)).unsqueeze(-1) * scale
-
-        cnt_mat = torch.bmm(a_cnt, b_cnt.transpose(1, 2)) - torch.bmm(
-            b_cnt, a_cnt.transpose(1, 2)
         )
-        cross_mask = torch.bmm(rad_w.unsqueeze(-1), dire_w.unsqueeze(1))
-        cnt_diff = (cnt_mat * cross_mask).sum(dim=(1, 2)).unsqueeze(-1) * scale
+        bot_logits5 = self.sidelane_head(bot_in)
 
-        return self.win_pair_head(torch.cat([prior_diff, syn_diff, cnt_diff], dim=-1))
+        # Top lane: Dire Safe (0, 4) vs Radiant Off (2, 3), mirrored to Radiant-view classes
+        top_in = torch.cat(
+            [
+                cls_out,
+                dire_by_pos[:, 0, :],
+                dire_by_pos[:, 4, :],
+                rad_by_pos[:, 2, :],
+                rad_by_pos[:, 3, :],
+                dire_by_pos[:, 0, :] - rad_by_pos[:, 2, :],
+                dire_by_pos[:, 4, :] - rad_by_pos[:, 3, :],
+            ],
+            dim=-1,
+        )
+        top_raw5 = self.sidelane_head(top_in)
+        top_logits5 = torch.cat(
+            [
+                top_raw5[:, 4:5],
+                top_raw5[:, 3:4],
+                top_raw5[:, 2:3],
+                top_raw5[:, 1:2],
+                top_raw5[:, 0:1],
+            ],
+            dim=-1,
+        )
+
+        # Mid lane: antisymmetric advantage (stomp, win) + symmetric spread baseline (stomp, win, tie)
+        m_r = rad_by_pos[:, 1, :]
+        m_d = dire_by_pos[:, 1, :]
+        adv_r = self.mid_adv_head(torch.cat([cls_out, m_r, m_d, m_r - m_d], dim=-1))
+        adv_d = self.mid_adv_head(torch.cat([cls_out, m_d, m_r, m_d - m_r], dim=-1))
+        adv = 0.5 * (adv_r - adv_d)  # [B, 2]: [stomp_adv, win_adv]
+        sym = self.mid_sym_head(
+            torch.cat([cls_out, 0.5 * (m_r + m_d), torch.abs(m_r - m_d)], dim=-1)
+        )  # [B, 3]: [stomp_base, win_base, tie_base]
+        mid_logits5 = torch.cat(
+            [
+                sym[:, 0:1] + adv[:, 0:1],
+                sym[:, 1:2] + adv[:, 1:2],
+                sym[:, 2:3],
+                sym[:, 1:2] - adv[:, 1:2],
+                sym[:, 0:1] - adv[:, 0:1],
+            ],
+            dim=-1,
+        )
+        return torch.stack([top_logits5, mid_logits5, bot_logits5], dim=1)  # [B, 3, 5]
 
     def _build_team_relative_scenario(
         self,
@@ -555,21 +682,38 @@ class D2OracleEncoder(nn.Module):
             dim=-1,
         )
 
-    def _condition_slot_memory(
+    def _encode_stage2_memory(
         self,
-        slot_memory: torch.Tensor,
+        s1_slot_memory: torch.Tensor,
+        hero_idx: torch.Tensor,
+        is_radiant: torch.Tensor,
+        pos_idx: torch.Tensor,
         scenario_vec: torch.Tensor,
     ) -> torch.Tensor:
-        """Modulate per-slot draft representations with per-slot team-relative Stage-1 scenario."""
-        scen_feat = self.scenario_mlp(scenario_vec)  # [B, 10, d]
+        """Fuse dedicated Stage-2 role/hero embeddings, FiLM scenario modulation, and Stage-2 Transformer."""
+        bsz = hero_idx.shape[0]
+        s2_h = self.s2_hero_emb(hero_idx)
+        s2_p = self.s2_pos_emb(pos_idx)
+        s2_t = self.s2_team_emb(is_radiant)
+        active_f = (hero_idx > 0).to(s2_h.dtype)  # [B, 10]
+        s2_hp = self.s2_hp_fuse(torch.cat([s2_h, s2_p, s2_h * s2_p], dim=-1))
+        s2_tok = (s2_hp + s2_t) * active_f.unsqueeze(-1)
+
+        base_mem = self.s2_in_proj(torch.cat([s1_slot_memory, s2_tok], dim=-1))
+
+        scen_feat = self.scenario_mlp(scenario_vec.to(base_mem.dtype))
         gamma, beta = self.scenario_film(scen_feat).chunk(2, dim=-1)
         gamma = torch.tanh(gamma)
 
-        modulated = self.stage2_norm(slot_memory * (1.0 + gamma) + beta)
+        modulated = self.stage2_norm(base_mem * (1.0 + gamma) + beta)
         delta = self.stage2_fuse(torch.cat([modulated, scen_feat], dim=-1))
         out = self.stage2_norm(modulated + delta)
-        if self.stage2_block is not None:
-            out = self.stage2_block(out)
+
+        if len(self.stage2_layers) > 0:
+            s2_key_bias = ((1.0 - (hero_idx > 0).to(torch.float32)) * -1e4).view(bsz, 1, 1, 10)
+            for layer in self.stage2_layers:
+                out = layer(out, attn_bias=s2_key_bias)
+            out = self.stage2_out_norm(out)
         return out
 
     def forward_stage1(
@@ -578,30 +722,78 @@ class D2OracleEncoder(nn.Module):
         is_radiant: torch.Tensor,
         pos_idx: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run shared draft backbone and Stage-1 match-level heads only."""
+        """Run side-equivariant Stage-1 backbone, BilinearFM, and match-level heads."""
         bsz = hero_idx.shape[0]
-        hp_emb = self.hero_emb(hero_idx) + self.pos_emb(pos_idx)
-        slot_emb = hp_emb + self.team_emb(is_radiant)
+        active_f = (hero_idx > 0).to(torch.float32)  # [B, 10]
+        slot_emb = (self.hero_emb(hero_idx) + self.pos_emb(pos_idx)) * active_f.unsqueeze(-1).to(
+            self.hero_emb.weight.dtype
+        )
         cls = self.cls_token.expand(bsz, -1, -1)
         x = self.emb_drop(torch.cat([cls, slot_emb], dim=1))
+
+        # Side-equivariant relative attention bias + <PAD> key masking
+        rad_f = is_radiant.to(torch.float32)
+        dire_f = 1.0 - rad_f
+        same = rad_f.unsqueeze(2) * rad_f.unsqueeze(1) + dire_f.unsqueeze(2) * dire_f.unsqueeze(1)
+        off_diag = self.pair_off_diag
+        diag = 1.0 - off_diag
+        same_other = (same * off_diag).unsqueeze(1)
+        opp_other = ((1.0 - same) * off_diag).unsqueeze(1)
+        self_mask = diag.unsqueeze(1)
+
+        slot_to_slot = (
+            same_other * self.s1_same_team_bias
+            + opp_other * self.s1_opp_team_bias
+            + self_mask * self.s1_self_bias
+        )  # [B, H, 10, 10]
+        top_row = torch.cat(
+            [
+                self.s1_cls_self_bias.expand(bsz, -1, 1, 1),
+                self.s1_cls_to_slot_bias.expand(bsz, -1, 1, 10),
+            ],
+            dim=-1,
+        )
+        bot_rows = torch.cat(
+            [self.s1_slot_to_cls_bias.expand(bsz, -1, 10, 1), slot_to_slot],
+            dim=-1,
+        )
+        rel_bias = torch.cat([top_row, bot_rows], dim=2)  # [B, H, 11, 11]
+
+        ones_cls = torch.ones((bsz, 1), device=hero_idx.device, dtype=torch.float32)
+        active_tok = torch.cat([ones_cls, active_f], dim=1)  # [B, 11]
+        key_pad_bias = ((1.0 - active_tok) * -1e4).view(bsz, 1, 1, 11)
+        attn_bias = rel_bias + key_pad_bias
+
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, attn_bias=attn_bias)
         x = self.final_norm(x)
 
         cls_out = x[:, 0, :]
-        slot_memory = x[:, 1:, :]  # [B, 10, d]
+        active_w = active_f.to(x.dtype).unsqueeze(-1)
+        slot_memory = x[:, 1:, :] * active_w  # [B, 10, d]
 
-        rad_w = is_radiant.to(slot_memory.dtype).unsqueeze(-1)
-        dire_w = 1.0 - rad_w
+        rad_w = is_radiant.to(slot_memory.dtype).unsqueeze(-1) * active_w
+        dire_w = (1.0 - is_radiant.to(slot_memory.dtype)).unsqueeze(-1) * active_w
         rad_pool = (slot_memory * rad_w).sum(dim=1) / rad_w.sum(dim=1).clamp(min=1.0)
         dire_pool = (slot_memory * dire_w).sum(dim=1) / dire_w.sum(dim=1).clamp(min=1.0)
-        match_repr = torch.cat([cls_out, rad_pool - dire_pool, rad_pool + dire_pool], dim=-1)
 
-        pair_win_logit = self._compute_pairwise_win_prior(hero_idx, is_radiant, pos_idx, hp_emb)
-        win_logit = self.win_head(match_repr) + pair_win_logit  # [B, 1]
-        win_prob = torch.sigmoid(win_logit)
+        # Standalone BilinearFM (+ optional bounded antisymmetric trunk residual)
+        win_logit = self.compute_fm_win_logit(hero_idx, is_radiant, pos_idx, include_map_bias=True)
+        if self.win_res_mlp is not None and self.win_trunk_scale > 0.0:
+            cls_f = cls_out.detach() if not self.training else cls_out
+            rp_d, dp_d = rad_pool.detach(), dire_pool.detach()
+            s_rd = self.win_res_mlp(torch.cat([cls_f, rp_d, dp_d, rp_d - dp_d], dim=-1))
+            s_dr = self.win_res_mlp(torch.cat([cls_f, dp_d, rp_d, dp_d - rp_d], dim=-1))
+            win_logit = win_logit + self.win_trunk_scale * torch.tanh(0.5 * (s_rd - s_dr).float())
 
-        dur_raw = self.duration_head(match_repr.float())
+        temp = self.win_temperature.clamp(min=0.25, max=4.0)
+        win_prob = torch.sigmoid(win_logit / temp)
+
+        # Strictly team-swap invariant duration quantiles
+        dur_in = torch.cat(
+            [cls_out, 0.5 * (rad_pool + dire_pool), torch.abs(rad_pool - dire_pool)], dim=-1
+        )
+        dur_raw = self.duration_head(dur_in.float())
         p50 = MIN_MATCH_DURATION_MIN + F.softplus(dur_raw[:, 0:1])
         delta_lo = F.softplus(dur_raw[:, 1:2])
         delta_hi = F.softplus(dur_raw[:, 2:3])
@@ -609,17 +801,35 @@ class D2OracleEncoder(nn.Module):
         p75 = p50.detach() + delta_hi
         duration_quantiles = torch.cat([p25, p50, p75], dim=-1)  # [B, 3]
 
-        lane_feats = self._compute_lane_features(slot_memory, is_radiant, pos_idx, match_repr)
-        lane_logits = self.lane_head(lane_feats)  # [B, 3, 3]
-        lane_probs = F.softmax(lane_logits, dim=-1)
+        # 5-class ordinal mirror lanes collapsed cleanly to 3-class [Rad, Even, Dire]
+        lane_logits5 = self._compute_lane_logits5(
+            cls_out, slot_memory, is_radiant, pos_idx, active_w
+        )
+        lane_probs5 = torch.softmax(lane_logits5.float(), dim=-1)
+        lane_probs = torch.stack(
+            [
+                lane_probs5[..., 0] + lane_probs5[..., 1],
+                lane_probs5[..., 2],
+                lane_probs5[..., 3] + lane_probs5[..., 4],
+            ],
+            dim=-1,
+        )
+        lane_logits = torch.log(lane_probs.clamp(min=1e-7))
 
-        lead10_input = torch.cat([match_repr, lane_feats.mean(dim=1)], dim=-1)
-        lead10 = self.lead10_head(lead10_input) * GOLD_XP_LEAD_SCALE  # [B, 2]
+        # Antisymmetric @10m gold/XP leads
+        l_rd = self.lead10_head(
+            torch.cat([cls_out, rad_pool, dire_pool, rad_pool - dire_pool], dim=-1)
+        )
+        l_dr = self.lead10_head(
+            torch.cat([cls_out, dire_pool, rad_pool, dire_pool - rad_pool], dim=-1)
+        )
+        lead10 = (0.5 * (l_rd - l_dr).float()) * GOLD_XP_LEAD_SCALE  # [B, 2]
 
         return {
             "win_logit": win_logit,
             "win_prob": win_prob,
             "duration_quantiles": duration_quantiles,
+            "lane_logits5": lane_logits5,
             "lane_logits": lane_logits,
             "lane_probs": lane_probs,
             "lead10": lead10,
@@ -649,10 +859,11 @@ class D2OracleEncoder(nn.Module):
         win_logit = stage1["win_logit"]
         win_prob = stage1["win_prob"]
         duration_quantiles = stage1["duration_quantiles"]
+        lane_logits5 = stage1["lane_logits5"]
         lane_logits = stage1["lane_logits"]
         lane_probs = stage1["lane_probs"]
         lead10 = stage1["lead10"]
-        slot_memory = stage1["slot_memory"]
+        slot_memory = stage1["slot_memory"].detach()
 
         # ---- Detached Stage-1 scenario + optional scheduled teacher forcing + duration override ----
         scen_win = win_prob.detach()
@@ -701,7 +912,9 @@ class D2OracleEncoder(nn.Module):
         )
 
         # ---- Stage 2 conditioning & heads ----
-        cond_slot_memory = self._condition_slot_memory(slot_memory, scenario_vec)
+        cond_slot_memory = self._encode_stage2_memory(
+            slot_memory, hero_idx, is_radiant, pos_idx, scenario_vec
+        )
 
         combat_rates = F.softplus(self.combat_rate_head(cond_slot_memory).float()) * DPM_HPM_SCALE
         combat_share_logits = self.combat_share_head(cond_slot_memory).view(bsz, 2, 5, 4)
@@ -725,6 +938,7 @@ class D2OracleEncoder(nn.Module):
             "win_logit": win_logit,
             "win_prob": win_prob,
             "duration_quantiles": duration_quantiles,
+            "lane_logits5": lane_logits5,
             "lane_logits": lane_logits,
             "lane_probs": lane_probs,
             "lead10": lead10,

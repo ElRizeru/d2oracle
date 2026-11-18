@@ -9,15 +9,18 @@ import math
 import os
 import random
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from training.config import ModelSpec, TrainingConfig
 from training.dataset import (
+    STAGE1_BATCH_KEYS,
     DotaDraftDataset,
     TensorBatchLoader,
     VocabIndex,
@@ -57,11 +60,13 @@ def build_model_spec(vidx: VocabIndex, cfg: TrainingConfig) -> ModelSpec:
         d_model=cfg.d_model,
         nhead=cfg.nhead,
         num_encoder_layers=cfg.num_encoder_layers,
+        stage2_num_layers=cfg.stage2_num_layers,
         num_decoder_layers=cfg.num_decoder_layers,
         dim_feedforward=cfg.dim_feedforward,
         dropout=cfg.dropout,
         stage1_pair_dim=cfg.stage1_pair_dim,
         stage1_pair_dropout=cfg.stage1_pair_dropout,
+        stage1_win_trunk_scale=cfg.stage1_win_trunk_scale,
         use_stage2_block=cfg.use_stage2_block,
         eos_logit_penalty=cfg.eos_logit_penalty,
         eos_stop_prob=cfg.eos_stop_prob,
@@ -223,7 +228,10 @@ def _run_epoch(
     steps = 0
 
     for raw_batch in loader:
-        batch = {k: v.to(device, non_blocking=True) for k, v in raw_batch.items()}
+        batch = {
+            k: (v if v.device == device else v.to(device, non_blocking=True))
+            for k, v in raw_batch.items()
+        }
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
@@ -252,6 +260,8 @@ def _run_epoch(
                 loss, scalars = compute_multitask_loss_tensors(
                     outputs, batch, cfg, stage_mode=stage_mode
                 )
+                if is_train and stage_mode in ("stage1", "all") and cfg.fm_l2_weight > 0.0:
+                    loss = loss + float(cfg.fm_l2_weight) * model.encoder.fm_l2()
 
             if is_train:
                 _optimizer_step(
@@ -317,6 +327,7 @@ def save_checkpoint(
     best_val_loss: float | None = None,
     best_stage1_score: float | None = None,
     phase: int | None = None,
+    stage2_start_epoch: int | None = None,
     history: list[dict[str, Any]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +351,8 @@ def save_checkpoint(
         payload["best_stage1_score"] = float(best_stage1_score)
     if phase is not None:
         payload["phase"] = int(phase)
+    if stage2_start_epoch is not None:
+        payload["stage2_start_epoch"] = int(stage2_start_epoch)
     if history is not None:
         payload["history"] = history
     torch.save(payload, path)
@@ -353,10 +366,19 @@ def _build_batch_loader(
     num_workers: int,
     seed: int,
     pin_memory: bool,
+    keys: Sequence[str] | None = None,
+    device: torch.device | None = None,
 ) -> TensorBatchLoader | DataLoader[dict[str, torch.Tensor]]:
     bs = min(int(batch_size), max(1, len(ds)))
     if num_workers == 0:
-        return TensorBatchLoader(ds, batch_size=bs, shuffle=shuffle, seed=seed)
+        return TensorBatchLoader(
+            ds,
+            batch_size=bs,
+            shuffle=shuffle,
+            seed=seed,
+            keys=keys,
+            device=device,
+        )
     return DataLoader(
         ds,
         batch_size=bs,
@@ -378,7 +400,7 @@ def _resolve_stage1_epochs(cfg: TrainingConfig) -> int:
 
 
 def _build_adamw_cosine(
-    params: list[torch.nn.Parameter],
+    params_or_groups: list[torch.nn.Parameter] | list[dict[str, Any]],
     *,
     lr: float,
     weight_decay: float,
@@ -390,7 +412,7 @@ def _build_adamw_cosine(
     torch.optim.lr_scheduler.LambdaLR,
     torch.amp.GradScaler,
 ]:
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(params_or_groups, lr=lr, weight_decay=weight_decay)
     steps = max(1, int(total_steps))
     warmup_steps = int(steps * warmup_ratio)
 
@@ -403,6 +425,91 @@ def _build_adamw_cosine(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp_cuda)
     return optimizer, scheduler, scaler
+
+
+def _build_stage1_param_groups(
+    model: D2OracleModel,
+    *,
+    base_lr: float,
+    fm_lr: float,
+    weight_decay: float,
+    include_stage2: bool = False,
+) -> list[dict[str, Any]]:
+    fm_params = [p for p in model.encoder.fm_parameters() if p.requires_grad]
+    fm_ids = {id(p) for p in fm_params}
+    pool = model.parameters() if include_stage2 else model.encoder.stage1_parameters()
+    other_params = [p for p in pool if p.requires_grad and id(p) not in fm_ids]
+    groups: list[dict[str, Any]] = []
+    if fm_params:
+        groups.append({"params": fm_params, "lr": fm_lr, "weight_decay": 0.0})
+    if other_params:
+        groups.append({"params": other_params, "lr": base_lr, "weight_decay": weight_decay})
+    return groups
+
+
+@torch.no_grad()
+def fit_win_temperature(
+    model: D2OracleModel,
+    val_loader: TensorBatchLoader | DataLoader[dict[str, torch.Tensor]],
+    device: torch.device,
+    *,
+    min_samples: int = 64,
+    t_min: float = 0.5,
+    t_max: float = 3.0,
+) -> float:
+    """Calibrate scalar win_temperature on validation logits minimizing exact NLL."""
+    model.eval()
+    logits_all: list[torch.Tensor] = []
+    targets_all: list[torch.Tensor] = []
+    for raw_batch in val_loader:
+        batch = {
+            k: (v if v.device == device else v.to(device, non_blocking=True))
+            for k, v in raw_batch.items()
+        }
+        s1 = model.forward_stage1(batch["hero_idx"], batch["is_radiant"], batch["pos_idx"])
+        logits_all.append(s1["win_logit"].squeeze(-1).float())
+        targets_all.append(batch["radiant_win"].float())
+
+    if not logits_all:
+        return float(model.encoder.win_temperature.item())
+    logits = torch.cat(logits_all, dim=0)
+    targets = torch.cat(targets_all, dim=0)
+    if logits.numel() < min_samples or not (float(targets.min()) < 0.5 < float(targets.max())):
+        return float(model.encoder.win_temperature.item())
+
+    nll_before = float(F.binary_cross_entropy_with_logits(logits, targets).item())
+    grid = torch.linspace(t_min, t_max, 251, device=logits.device, dtype=torch.float32)
+    nlls = torch.stack(
+        [F.binary_cross_entropy_with_logits(logits / t, targets) for t in grid]
+    )
+    best_idx = int(torch.argmin(nlls).item())
+    best_t = float(grid[best_idx].item())
+    lo = max(t_min, best_t - 0.05)
+    hi = min(t_max, best_t + 0.05)
+    fine_grid = torch.linspace(lo, hi, 101, device=logits.device, dtype=torch.float32)
+    fine_nlls = torch.stack(
+        [F.binary_cross_entropy_with_logits(logits / t, targets) for t in fine_grid]
+    )
+    fine_idx = int(torch.argmin(fine_nlls).item())
+    best_t = float(fine_grid[fine_idx].item())
+    nll_after = float(fine_nlls[fine_idx].item())
+
+    if nll_after < nll_before - 1e-6:
+        model.encoder.win_temperature.fill_(best_t)
+        probs_before = torch.sigmoid(logits)
+        probs_after = torch.sigmoid(logits / best_t)
+        brier_before = float(((probs_before - targets) ** 2).mean().item())
+        brier_after = float(((probs_after - targets) ** 2).mean().item())
+        logger.info(
+            "Calibrated Stage-1 win_temperature=%.3f | val_nll %.4f -> %.4f | val_brier %.4f -> %.4f",
+            best_t,
+            nll_before,
+            nll_after,
+            brier_before,
+            brier_after,
+        )
+        return best_t
+    return float(model.encoder.win_temperature.item())
 
 
 def _load_resume_checkpoint(
@@ -423,10 +530,12 @@ def _load_resume_checkpoint(
         "d_model",
         "nhead",
         "num_encoder_layers",
+        "stage2_num_layers",
         "num_decoder_layers",
         "dim_feedforward",
         "max_item_len",
         "stage1_pair_dim",
+        "stage1_win_trunk_scale",
         "use_stage2_block",
     )
     cur_spec = spec.to_dict()
@@ -528,27 +637,6 @@ def train_from_datasets(
     model = D2OracleModel(spec, skill_mask).to(device)
     amp_cuda = cfg.use_amp and device.type == "cuda"
 
-    train_loader = _build_batch_loader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        seed=cfg.seed,
-        pin_memory=device.type == "cuda",
-    )
-    val_loader = (
-        _build_batch_loader(
-            val_ds,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            seed=cfg.seed,
-            pin_memory=device.type == "cuda",
-        )
-        if val_ds is not None and len(val_ds) > 0
-        else None
-    )
-
     cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     (cfg.checkpoint_dir / "vocab.json").write_text(
         json.dumps(vocab, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -574,6 +662,7 @@ def train_from_datasets(
     train_start = time.monotonic()
 
     s1_epochs = _resolve_stage1_epochs(cfg)
+    has_val = val_ds is not None and len(val_ds) > 0
 
     if cfg.resume and last_path.exists():
         ckpt = _load_resume_checkpoint(last_path, model, spec, cfg)
@@ -586,261 +675,88 @@ def train_from_datasets(
         resume_phase = int(raw_phase) if raw_phase is not None else None
         logger.info("Resumed training from %s at epoch %d/%d", last_path, start_epoch, cfg.epochs)
 
-    steps_per_epoch = max(1, len(train_loader))
+    effective_bs = min(int(cfg.batch_size), max(1, len(train_ds)))
+    steps_per_epoch = max(1, (len(train_ds) + effective_bs - 1) // effective_bs)
+    base_s1_lr = float(cfg.stage1_lr if cfg.stage1_lr is not None else cfg.lr)
+    base_fm_lr = float(cfg.fm_lr if cfg.fm_lr is not None else max(base_s1_lr, base_s1_lr * 1.5))
 
     if s1_epochs == 0:
         # ---- Single-phase joint training ----
-        optimizer, scheduler, scaler = _build_adamw_cosine(
-            list(model.parameters()),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-            total_steps=max(1, cfg.epochs * steps_per_epoch),
-            warmup_ratio=cfg.warmup_ratio,
-            use_amp_cuda=amp_cuda,
+        train_loader = _build_batch_loader(
+            train_ds,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            seed=cfg.seed,
+            pin_memory=device.type == "cuda",
+            device=device,
         )
-        if ckpt is not None:
-            if "optimizer_state_dict" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            if "scheduler_state_dict" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            if "scaler_state_dict" in ckpt and amp_cuda:
-                scaler.load_state_dict(ckpt["scaler_state_dict"])
-
-        for epoch in range(start_epoch, cfg.epochs + 1):
-            t_ep = time.monotonic()
-            mix_p = _scheduled_scenario_mix(cfg, epoch)
-            train_stats = _run_epoch(
+        val_loader = (
+            _build_batch_loader(
+                val_ds,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=cfg.num_workers,
+                seed=cfg.seed,
+                pin_memory=device.type == "cuda",
+                device=device,
+            )
+            if has_val
+            else None
+        )
+        try:
+            opt_groups = _build_stage1_param_groups(
                 model,
-                train_loader,
-                cfg,
-                device,
-                stage_mode="all",
-                scenario_mix=mix_p,
-                duration_mix=cfg.duration_teacher_forcing_prob,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-            )
-            val_stats = (
-                _run_epoch(
-                    model, val_loader, cfg, device, stage_mode="all", scenario_mix=0.0, duration_mix=0.0
-                )
-                if val_loader is not None
-                else dict(train_stats)
-            )
-            val_score = _compute_val_selection_score(val_stats)
-            val_stats["val_selection_score"] = val_score
-            ep_sec = time.monotonic() - t_ep
-            history.append(
-                {
-                    "epoch": epoch,
-                    "phase": 0,
-                    "scenario_mix": mix_p,
-                    "elapsed_sec": round(ep_sec, 2),
-                    "train": train_stats,
-                    "val": val_stats,
-                }
-            )
-            _log_epoch_summary(
-                epoch,
-                cfg.epochs,
-                phase_label="Joint",
-                mix_p=mix_p,
-                train_stats=train_stats,
-                val_stats=val_stats,
-                val_score=val_score,
-                elapsed_sec=ep_sec,
-            )
-            if val_score <= best_score:
-                best_score = val_score
-                best_loss = val_stats["loss_total"]
-                best_epoch = epoch
-                best_val_metrics = dict(val_stats)
-                save_checkpoint(best_path, model, spec, epoch, val_stats, phase=0)
-
-            save_checkpoint(
-                last_path,
-                model,
-                spec,
-                epoch,
-                val_stats,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler if amp_cuda else None,
-                best_val_score=best_score,
-                best_val_loss=best_loss,
-                phase=0,
-                history=history,
-            )
-            (cfg.checkpoint_dir / "history.json").write_text(
-                json.dumps(history, indent=2), encoding="utf-8"
-            )
-    else:
-        # ---- Two-phase training: Phase 1 (Stage-1) -> Best Stage-1 Freeze -> Phase 2 (Stage-2) ----
-        s1_params = [model.encoder.cls_token]
-        for mod in model.encoder._stage1_submodules():
-            s1_params.extend(mod.parameters())
-
-        if start_epoch <= s1_epochs:
-            model.set_stage1_frozen(False)
-            opt1, sched1, scaler1 = _build_adamw_cosine(
-                s1_params,
-                lr=float(cfg.stage1_lr if cfg.stage1_lr is not None else cfg.lr),
+                base_lr=cfg.lr,
+                fm_lr=float(cfg.fm_lr if cfg.fm_lr is not None else max(cfg.lr, cfg.lr * 1.5)),
                 weight_decay=cfg.weight_decay,
-                total_steps=max(1, s1_epochs * steps_per_epoch),
+                include_stage2=True,
+            )
+            optimizer, scheduler, scaler = _build_adamw_cosine(
+                opt_groups,
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+                total_steps=max(1, cfg.epochs * steps_per_epoch),
                 warmup_ratio=cfg.warmup_ratio,
                 use_amp_cuda=amp_cuda,
             )
-            if ckpt is not None and resume_phase == 1:
+            if ckpt is not None:
                 if "optimizer_state_dict" in ckpt:
-                    opt1.load_state_dict(ckpt["optimizer_state_dict"])
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 if "scheduler_state_dict" in ckpt:
-                    sched1.load_state_dict(ckpt["scheduler_state_dict"])
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 if "scaler_state_dict" in ckpt and amp_cuda:
-                    scaler1.load_state_dict(ckpt["scaler_state_dict"])
+                    scaler.load_state_dict(ckpt["scaler_state_dict"])
 
-            for epoch in range(start_epoch, s1_epochs + 1):
+            for epoch in range(start_epoch, cfg.epochs + 1):
                 t_ep = time.monotonic()
+                mix_p = _scheduled_scenario_mix(cfg, epoch)
                 train_stats = _run_epoch(
                     model,
                     train_loader,
                     cfg,
                     device,
-                    stage_mode="stage1",
-                    optimizer=opt1,
-                    scheduler=sched1,
-                    scaler=scaler1,
-                )
-                val_stats = (
-                    _run_epoch(model, val_loader, cfg, device, stage_mode="stage1")
-                    if val_loader is not None
-                    else dict(train_stats)
-                )
-                s1_score = compute_stage1_val_score(val_stats)
-                val_stats["val_selection_score"] = s1_score
-                ep_sec = time.monotonic() - t_ep
-                history.append(
-                    {
-                        "epoch": epoch,
-                        "phase": 1,
-                        "scenario_mix": 0.0,
-                        "elapsed_sec": round(ep_sec, 2),
-                        "train": train_stats,
-                        "val": val_stats,
-                    }
-                )
-                _log_epoch_summary(
-                    epoch,
-                    cfg.epochs,
-                    phase_label="Phase 1",
-                    mix_p=None,
-                    train_stats=train_stats,
-                    val_stats=val_stats,
-                    val_score=s1_score,
-                    elapsed_sec=ep_sec,
-                )
-                if s1_score <= best_stage1_score:
-                    best_stage1_score = s1_score
-                    best_stage1_epoch = epoch
-                    best_stage1_metrics = dict(val_stats)
-                    save_checkpoint(
-                        best_stage1_path,
-                        model,
-                        spec,
-                        epoch,
-                        val_stats,
-                        best_stage1_score=best_stage1_score,
-                        phase=1,
-                    )
-
-                save_checkpoint(
-                    last_path,
-                    model,
-                    spec,
-                    epoch,
-                    val_stats,
-                    optimizer=opt1,
-                    scheduler=sched1,
-                    scaler=scaler1 if amp_cuda else None,
-                    best_val_score=best_score,
-                    best_val_loss=best_loss,
-                    best_stage1_score=best_stage1_score,
-                    phase=1,
-                    history=history,
-                )
-                (cfg.checkpoint_dir / "history.json").write_text(
-                    json.dumps(history, indent=2), encoding="utf-8"
-                )
-
-        s2_start = max(start_epoch, s1_epochs + 1)
-        if s2_start <= cfg.epochs:
-            entering_phase2_fresh = resume_phase != 2 or start_epoch <= s1_epochs
-            if entering_phase2_fresh and best_stage1_path.exists():
-                s1_ckpt = torch.load(best_stage1_path, map_location="cpu", weights_only=False)
-                model.load_state_dict(s1_ckpt["model_state_dict"], strict=True)
-                best_stage1_epoch = int(s1_ckpt.get("epoch", best_stage1_epoch or 0)) or None
-                best_stage1_metrics = dict(s1_ckpt.get("metrics") or {}) or best_stage1_metrics
-                logger.info(
-                    "Loaded best Phase-1 Stage-1 checkpoint (epoch=%s, s1_score=%.4f) before Phase 2 freeze",
-                    s1_ckpt.get("epoch"),
-                    float(s1_ckpt.get("best_stage1_score", best_stage1_score)),
-                )
-
-            model.set_stage1_frozen(True)
-            s2_params = [p for p in model.parameters() if p.requires_grad]
-            s2_total_epochs = max(1, cfg.epochs - s1_epochs)
-            opt2, sched2, scaler2 = _build_adamw_cosine(
-                s2_params,
-                lr=float(cfg.stage2_lr if cfg.stage2_lr is not None else cfg.lr),
-                weight_decay=cfg.weight_decay,
-                total_steps=max(1, s2_total_epochs * steps_per_epoch),
-                warmup_ratio=cfg.warmup_ratio,
-                use_amp_cuda=amp_cuda,
-            )
-            if ckpt is not None and resume_phase == 2 and not entering_phase2_fresh:
-                if "optimizer_state_dict" in ckpt:
-                    opt2.load_state_dict(ckpt["optimizer_state_dict"])
-                if "scheduler_state_dict" in ckpt:
-                    sched2.load_state_dict(ckpt["scheduler_state_dict"])
-                if "scaler_state_dict" in ckpt and amp_cuda:
-                    scaler2.load_state_dict(ckpt["scaler_state_dict"])
-
-            for epoch in range(s2_start, cfg.epochs + 1):
-                t_ep = time.monotonic()
-                phase2_ep = epoch - s1_epochs
-                mix_p = _scheduled_scenario_mix(cfg, phase2_ep, total_phase_epochs=s2_total_epochs)
-                train_stats = _run_epoch(
-                    model,
-                    train_loader,
-                    cfg,
-                    device,
-                    stage_mode="stage2",
+                    stage_mode="all",
                     scenario_mix=mix_p,
                     duration_mix=cfg.duration_teacher_forcing_prob,
-                    optimizer=opt2,
-                    scheduler=sched2,
-                    scaler=scaler2,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
                 )
                 val_stats = (
                     _run_epoch(
-                        model,
-                        val_loader,
-                        cfg,
-                        device,
-                        stage_mode="stage2",
-                        scenario_mix=0.0,
-                        duration_mix=0.0,
+                        model, val_loader, cfg, device, stage_mode="all", scenario_mix=0.0, duration_mix=0.0
                     )
                     if val_loader is not None
                     else dict(train_stats)
                 )
-                val_score = compute_stage2_val_score(val_stats)
+                val_score = _compute_val_selection_score(val_stats)
                 val_stats["val_selection_score"] = val_score
                 ep_sec = time.monotonic() - t_ep
                 history.append(
                     {
                         "epoch": epoch,
-                        "phase": 2,
+                        "phase": 0,
                         "scenario_mix": mix_p,
                         "elapsed_sec": round(ep_sec, 2),
                         "train": train_stats,
@@ -850,7 +766,7 @@ def train_from_datasets(
                 _log_epoch_summary(
                     epoch,
                     cfg.epochs,
-                    phase_label="Phase 2",
+                    phase_label="Joint",
                     mix_p=mix_p,
                     train_stats=train_stats,
                     val_stats=val_stats,
@@ -862,15 +778,7 @@ def train_from_datasets(
                     best_loss = val_stats["loss_total"]
                     best_epoch = epoch
                     best_val_metrics = dict(val_stats)
-                    save_checkpoint(
-                        best_path,
-                        model,
-                        spec,
-                        epoch,
-                        val_stats,
-                        best_stage1_score=best_stage1_score,
-                        phase=2,
-                    )
+                    save_checkpoint(best_path, model, spec, epoch, val_stats, phase=0)
 
                 save_checkpoint(
                     last_path,
@@ -878,18 +786,357 @@ def train_from_datasets(
                     spec,
                     epoch,
                     val_stats,
-                    optimizer=opt2,
-                    scheduler=sched2,
-                    scaler=scaler2 if amp_cuda else None,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler if amp_cuda else None,
                     best_val_score=best_score,
                     best_val_loss=best_loss,
-                    best_stage1_score=best_stage1_score,
-                    phase=2,
+                    phase=0,
                     history=history,
                 )
                 (cfg.checkpoint_dir / "history.json").write_text(
                     json.dumps(history, indent=2), encoding="utf-8"
                 )
+        finally:
+            if isinstance(train_loader, TensorBatchLoader):
+                train_loader.release()
+            if isinstance(val_loader, TensorBatchLoader):
+                val_loader.release()
+    else:
+        # ---- Two-phase training: Phase 1 (Stage-1) -> Calibrate & Freeze -> Phase 2 (Stage-2) ----
+        phase1_last_epoch = s1_epochs
+        if start_epoch <= s1_epochs and resume_phase != 2:
+            s1_train_loader = _build_batch_loader(
+                train_ds,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                seed=cfg.seed,
+                pin_memory=device.type == "cuda",
+                keys=STAGE1_BATCH_KEYS,
+                device=device,
+            )
+            s1_val_loader = (
+                _build_batch_loader(
+                    val_ds,
+                    batch_size=cfg.batch_size,
+                    shuffle=False,
+                    num_workers=cfg.num_workers,
+                    seed=cfg.seed,
+                    pin_memory=device.type == "cuda",
+                    keys=STAGE1_BATCH_KEYS,
+                    device=device,
+                )
+                if has_val
+                else None
+            )
+            try:
+                model.set_stage1_frozen(False)
+                s1_groups = _build_stage1_param_groups(
+                    model,
+                    base_lr=base_s1_lr,
+                    fm_lr=base_fm_lr,
+                    weight_decay=cfg.weight_decay,
+                    include_stage2=False,
+                )
+                opt1, sched1, scaler1 = _build_adamw_cosine(
+                    s1_groups,
+                    lr=base_s1_lr,
+                    weight_decay=cfg.weight_decay,
+                    total_steps=max(1, s1_epochs * steps_per_epoch),
+                    warmup_ratio=cfg.warmup_ratio,
+                    use_amp_cuda=amp_cuda,
+                )
+                if ckpt is not None and resume_phase == 1:
+                    if "optimizer_state_dict" in ckpt:
+                        opt1.load_state_dict(ckpt["optimizer_state_dict"])
+                    if "scheduler_state_dict" in ckpt:
+                        sched1.load_state_dict(ckpt["scheduler_state_dict"])
+                    if "scaler_state_dict" in ckpt and amp_cuda:
+                        scaler1.load_state_dict(ckpt["scaler_state_dict"])
+
+                no_improve = 0
+                min_s1_epochs = min(s1_epochs, max(3, int(cfg.stage1_patience)))
+                for epoch in range(start_epoch, s1_epochs + 1):
+                    t_ep = time.monotonic()
+                    train_stats = _run_epoch(
+                        model,
+                        s1_train_loader,
+                        cfg,
+                        device,
+                        stage_mode="stage1",
+                        optimizer=opt1,
+                        scheduler=sched1,
+                        scaler=scaler1,
+                    )
+                    val_stats = (
+                        _run_epoch(model, s1_val_loader, cfg, device, stage_mode="stage1")
+                        if s1_val_loader is not None
+                        else dict(train_stats)
+                    )
+                    s1_score = compute_stage1_val_score(val_stats)
+                    val_stats["val_selection_score"] = s1_score
+                    ep_sec = time.monotonic() - t_ep
+                    history.append(
+                        {
+                            "epoch": epoch,
+                            "phase": 1,
+                            "scenario_mix": 0.0,
+                            "elapsed_sec": round(ep_sec, 2),
+                            "train": train_stats,
+                            "val": val_stats,
+                        }
+                    )
+                    _log_epoch_summary(
+                        epoch,
+                        cfg.epochs,
+                        phase_label="Phase 1",
+                        mix_p=None,
+                        train_stats=train_stats,
+                        val_stats=val_stats,
+                        val_score=s1_score,
+                        elapsed_sec=ep_sec,
+                    )
+                    if s1_score <= best_stage1_score:
+                        best_stage1_score = s1_score
+                        best_stage1_epoch = epoch
+                        best_stage1_metrics = dict(val_stats)
+                        no_improve = 0
+                        save_checkpoint(
+                            best_stage1_path,
+                            model,
+                            spec,
+                            epoch,
+                            val_stats,
+                            best_stage1_score=best_stage1_score,
+                            phase=1,
+                        )
+                    else:
+                        no_improve += 1
+
+                    save_checkpoint(
+                        last_path,
+                        model,
+                        spec,
+                        epoch,
+                        val_stats,
+                        optimizer=opt1,
+                        scheduler=sched1,
+                        scaler=scaler1 if amp_cuda else None,
+                        best_val_score=best_score,
+                        best_val_loss=best_loss,
+                        best_stage1_score=best_stage1_score,
+                        phase=1,
+                        history=history,
+                    )
+                    (cfg.checkpoint_dir / "history.json").write_text(
+                        json.dumps(history, indent=2), encoding="utf-8"
+                    )
+                    phase1_last_epoch = epoch
+
+                    if (
+                        cfg.stage1_patience > 0
+                        and epoch >= min_s1_epochs
+                        and epoch < s1_epochs
+                        and no_improve >= cfg.stage1_patience
+                    ):
+                        logger.info(
+                            "Phase 1 early stopping at epoch %d (best=%s, s1_score=%.4f)",
+                            epoch,
+                            best_stage1_epoch,
+                            best_stage1_score,
+                        )
+                        break
+            finally:
+                if isinstance(s1_train_loader, TensorBatchLoader):
+                    s1_train_loader.release()
+                if isinstance(s1_val_loader, TensorBatchLoader):
+                    s1_val_loader.release()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        if resume_phase == 2 and ckpt is not None:
+            s2_start = start_epoch
+            s2_origin_epoch = int(ckpt.get("stage2_start_epoch") or (s1_epochs + 1))
+        elif start_epoch <= s1_epochs:
+            s2_start = phase1_last_epoch + 1
+            s2_origin_epoch = s2_start
+        else:
+            s2_start = start_epoch
+            s2_origin_epoch = s1_epochs + 1
+
+        if s2_start <= cfg.epochs:
+            entering_phase2_fresh = resume_phase != 2
+            if entering_phase2_fresh and best_stage1_path.exists():
+                s1_ckpt = torch.load(best_stage1_path, map_location="cpu", weights_only=False)
+                model.load_state_dict(s1_ckpt["model_state_dict"], strict=True)
+                best_stage1_epoch = int(s1_ckpt.get("epoch", best_stage1_epoch or 0)) or None
+                best_stage1_metrics = dict(s1_ckpt.get("metrics") or {}) or best_stage1_metrics
+                logger.info(
+                    "Loaded best Phase-1 Stage-1 checkpoint (epoch=%s, s1_score=%.4f) before Phase 2 freeze",
+                    s1_ckpt.get("epoch"),
+                    float(s1_ckpt.get("best_stage1_score", best_stage1_score)),
+                )
+                if cfg.fit_win_temperature and has_val and val_ds is not None:
+                    cal_loader = _build_batch_loader(
+                        val_ds,
+                        batch_size=cfg.batch_size,
+                        shuffle=False,
+                        num_workers=cfg.num_workers,
+                        seed=cfg.seed,
+                        pin_memory=device.type == "cuda",
+                        keys=STAGE1_BATCH_KEYS,
+                        device=device,
+                    )
+                    try:
+                        fit_win_temperature(model, cal_loader, device)
+                        save_checkpoint(
+                            best_stage1_path,
+                            model,
+                            spec,
+                            best_stage1_epoch or phase1_last_epoch,
+                            best_stage1_metrics or {},
+                            best_stage1_score=best_stage1_score,
+                            phase=1,
+                        )
+                    finally:
+                        if isinstance(cal_loader, TensorBatchLoader):
+                            cal_loader.release()
+
+            model.set_stage1_frozen(True)
+            s2_params = [p for p in model.parameters() if p.requires_grad]
+            s2_total_epochs = max(1, cfg.epochs - s2_origin_epoch + 1)
+
+            s2_train_loader = _build_batch_loader(
+                train_ds,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_workers,
+                seed=cfg.seed,
+                pin_memory=device.type == "cuda",
+                device=device,
+            )
+            s2_val_loader = (
+                _build_batch_loader(
+                    val_ds,
+                    batch_size=cfg.batch_size,
+                    shuffle=False,
+                    num_workers=cfg.num_workers,
+                    seed=cfg.seed,
+                    pin_memory=device.type == "cuda",
+                    device=device,
+                )
+                if has_val
+                else None
+            )
+            try:
+                opt2, sched2, scaler2 = _build_adamw_cosine(
+                    s2_params,
+                    lr=float(cfg.stage2_lr if cfg.stage2_lr is not None else cfg.lr),
+                    weight_decay=cfg.weight_decay,
+                    total_steps=max(1, s2_total_epochs * steps_per_epoch),
+                    warmup_ratio=cfg.warmup_ratio,
+                    use_amp_cuda=amp_cuda,
+                )
+                if ckpt is not None and resume_phase == 2:
+                    if "optimizer_state_dict" in ckpt:
+                        opt2.load_state_dict(ckpt["optimizer_state_dict"])
+                    if "scheduler_state_dict" in ckpt:
+                        sched2.load_state_dict(ckpt["scheduler_state_dict"])
+                    if "scaler_state_dict" in ckpt and amp_cuda:
+                        scaler2.load_state_dict(ckpt["scaler_state_dict"])
+
+                for epoch in range(s2_start, cfg.epochs + 1):
+                    t_ep = time.monotonic()
+                    phase2_ep = epoch - s2_origin_epoch + 1
+                    mix_p = _scheduled_scenario_mix(cfg, phase2_ep, total_phase_epochs=s2_total_epochs)
+                    train_stats = _run_epoch(
+                        model,
+                        s2_train_loader,
+                        cfg,
+                        device,
+                        stage_mode="stage2",
+                        scenario_mix=mix_p,
+                        duration_mix=cfg.duration_teacher_forcing_prob,
+                        optimizer=opt2,
+                        scheduler=sched2,
+                        scaler=scaler2,
+                    )
+                    val_stats = (
+                        _run_epoch(
+                            model,
+                            s2_val_loader,
+                            cfg,
+                            device,
+                            stage_mode="stage2",
+                            scenario_mix=0.0,
+                            duration_mix=0.0,
+                        )
+                        if s2_val_loader is not None
+                        else dict(train_stats)
+                    )
+                    val_score = compute_stage2_val_score(val_stats)
+                    val_stats["val_selection_score"] = val_score
+                    ep_sec = time.monotonic() - t_ep
+                    history.append(
+                        {
+                            "epoch": epoch,
+                            "phase": 2,
+                            "scenario_mix": mix_p,
+                            "elapsed_sec": round(ep_sec, 2),
+                            "train": train_stats,
+                            "val": val_stats,
+                        }
+                    )
+                    _log_epoch_summary(
+                        epoch,
+                        cfg.epochs,
+                        phase_label="Phase 2",
+                        mix_p=mix_p,
+                        train_stats=train_stats,
+                        val_stats=val_stats,
+                        val_score=val_score,
+                        elapsed_sec=ep_sec,
+                    )
+                    if val_score <= best_score:
+                        best_score = val_score
+                        best_loss = val_stats["loss_total"]
+                        best_epoch = epoch
+                        best_val_metrics = dict(val_stats)
+                        save_checkpoint(
+                            best_path,
+                            model,
+                            spec,
+                            epoch,
+                            val_stats,
+                            best_stage1_score=best_stage1_score,
+                            phase=2,
+                        )
+
+                    save_checkpoint(
+                        last_path,
+                        model,
+                        spec,
+                        epoch,
+                        val_stats,
+                        optimizer=opt2,
+                        scheduler=sched2,
+                        scaler=scaler2 if amp_cuda else None,
+                        best_val_score=best_score,
+                        best_val_loss=best_loss,
+                        best_stage1_score=best_stage1_score,
+                        phase=2,
+                        stage2_start_epoch=s2_origin_epoch,
+                        history=history,
+                    )
+                    (cfg.checkpoint_dir / "history.json").write_text(
+                        json.dumps(history, indent=2), encoding="utf-8"
+                    )
+            finally:
+                if isinstance(s2_train_loader, TensorBatchLoader):
+                    s2_train_loader.release()
+                if isinstance(s2_val_loader, TensorBatchLoader):
+                    s2_val_loader.release()
 
     model.set_stage1_frozen(False)
     if not best_path.exists() and history:

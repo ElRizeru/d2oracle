@@ -673,7 +673,13 @@ describe("real v2 ONNX bundle inference in Node/WASM", () => {
       validateBundleMetadata(vocab, { ...modelConfig, encoder_arch_version: 3 }),
     ).not.toThrow();
     expect(() =>
+      validateBundleMetadata(vocab, { ...modelConfig, encoder_arch_version: 4 }),
+    ).not.toThrow();
+    expect(() =>
       validateBundleMetadata(vocab, { ...modelConfig, encoder_arch_version: 2 }),
+    ).toThrow(/Incompatible encoder architecture version/);
+    expect(() =>
+      validateBundleMetadata(vocab, { ...modelConfig, encoder_arch_version: 5 }),
     ).toThrow(/Incompatible encoder architecture version/);
     expect(() =>
       validateBundleMetadata(vocab, { ...modelConfig, encoder_arch_version: undefined }),
