@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import zipfile
 from collections import Counter
@@ -983,6 +984,68 @@ def _format_summary_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _first_non_none(*vals: Any) -> Any:
+    for val in vals:
+        if val is not None:
+            return val
+    return None
+
+
+def _round_or_none(val: Any, ndigits: int) -> float | None:
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
+        return round(float(val), ndigits)
+    return None
+
+
+def build_model_summary_metadata(
+    summary_payload: dict[str, Any],
+    vocab: dict[str, Any],
+) -> dict[str, Any]:
+    """Build compact dataset & holdout accuracy metadata for web model_config.json."""
+    ds = dict(summary_payload.get("dataset") or {})
+    best_overall = (summary_payload.get("best_overall") or {}).get("metrics") or {}
+    best_stage1 = (summary_payload.get("best_stage1") or {}).get("metrics") or {}
+    diag = summary_payload.get("validation_diagnostics") or {}
+    s1_bd = diag.get("stage1_breakdown") or {}
+    dur_bd = s1_bd.get("duration") or {}
+
+    return {
+        "trained_at_utc": summary_payload.get("generated_at_utc"),
+        "dataset_snapshot_utc": vocab.get("generated_at"),
+        "total_matches": int(ds.get("num_total") or 0),
+        "ranked_matches": int(ds.get("num_ranked") or 0),
+        "pro_matches": int(ds.get("num_pro") or 0),
+        "train_matches": int(ds.get("num_train") or 0),
+        "val_matches": int(ds.get("num_val") or 0),
+        "num_shards": int(ds.get("num_shards") or 0),
+        "num_heroes": int((vocab.get("heroes") or {}).get("num_heroes") or 0),
+        "num_key_items": int((vocab.get("items") or {}).get("num_key_items") or 0),
+        "bundle_size_mb": _round_or_none(summary_payload.get("total_export_mb"), 2),
+        "win_accuracy": _round_or_none(
+            _first_non_none(best_overall.get("win_acc"), best_stage1.get("win_acc")),
+            4,
+        ),
+        "lane_accuracy": _round_or_none(
+            _first_non_none(best_overall.get("lane_acc"), best_stage1.get("lane_acc")),
+            4,
+        ),
+        "duration_mae_min": _round_or_none(
+            _first_non_none(
+                best_overall.get("dur_p50_mae"),
+                best_stage1.get("dur_p50_mae"),
+                dur_bd.get("p50_mae_min"),
+            ),
+            2,
+        ),
+        "duration_window_coverage": _round_or_none(dur_bd.get("within_p25_p75_rate"), 4),
+        "skill_accuracy": _round_or_none(best_overall.get("skill_acc"), 4),
+        "talent_accuracy": _round_or_none(best_overall.get("talent_acc"), 4),
+        "item_accuracy": _round_or_none(best_overall.get("item_acc"), 4),
+        "item_timing_mae_min": _round_or_none(best_overall.get("item_min_mae"), 2),
+        "gpm_mae": _round_or_none(best_overall.get("gpm_p50_mae"), 1),
+    }
+
+
 def write_training_report(
     report_dir: Path,
     *,
@@ -1057,6 +1120,14 @@ def write_training_report(
     summary_json_path = report_dir / "training_summary.json"
     summary_json_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
     written["training_summary"] = summary_json_path
+
+    if exported and "model_config" in exported:
+        mc_path = Path(exported["model_config"])
+        if mc_path.exists():
+            mc_payload = json.loads(mc_path.read_text(encoding="utf-8"))
+            if isinstance(mc_payload, dict):
+                mc_payload["model_summary"] = build_model_summary_metadata(summary_payload, vocab)
+                mc_path.write_text(json.dumps(mc_payload, indent=2), encoding="utf-8")
 
     summary_md_path = report_dir / "summary.md"
     summary_md_path.write_text(_format_summary_markdown(summary_payload), encoding="utf-8")

@@ -84,6 +84,29 @@ export interface TargetScalesJson {
   heal_share_min_team_sum: number;
 }
 
+export interface ModelSummaryJson {
+  trained_at_utc?: string | null;
+  dataset_snapshot_utc?: string | null;
+  total_matches?: number | null;
+  ranked_matches?: number | null;
+  pro_matches?: number | null;
+  train_matches?: number | null;
+  val_matches?: number | null;
+  num_shards?: number | null;
+  num_heroes?: number | null;
+  num_key_items?: number | null;
+  bundle_size_mb?: number | null;
+  win_accuracy?: number | null;
+  lane_accuracy?: number | null;
+  duration_mae_min?: number | null;
+  duration_window_coverage?: number | null;
+  skill_accuracy?: number | null;
+  talent_accuracy?: number | null;
+  item_accuracy?: number | null;
+  item_timing_mae_min?: number | null;
+  gpm_mae?: number | null;
+}
+
 export interface ModelConfigJson {
   model_schema_version: number;
   encoder_arch_version?: number;
@@ -110,6 +133,7 @@ export interface ModelConfigJson {
   eos_logit_penalty?: number;
   eos_stop_prob?: number;
   target_scales: TargetScalesJson;
+  model_summary?: ModelSummaryJson;
 }
 
 export interface DraftSlot {

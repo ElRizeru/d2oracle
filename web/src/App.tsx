@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Cpu } from "lucide-react";
+import { ChevronDown, Cpu } from "lucide-react";
 
 import { BuildInspector } from "./components/BuildInspector";
 import { DraftWorkspace } from "./components/DraftWorkspace";
 import { HeroPickerModal } from "./components/HeroPickerModal";
 import { MatchSummaryBar } from "./components/MatchSummaryBar";
+import { ModelInfoModal } from "./components/ModelInfoModal";
 import {
   assignHeroToSlot,
   createEmptyDraft,
@@ -33,6 +34,7 @@ export function App() {
   const [slots, setSlots] = useState<DraftSlot[]>(() => createEmptyDraft());
   const [matchPace, setMatchPace] = useState<MatchPaceOption>(0);
   const [pickerSlotIdx, setPickerSlotIdx] = useState<number | null>(null);
+  const [modelInfoOpen, setModelInfoOpen] = useState<boolean>(false);
 
   const [prediction, setPrediction] = useState<DraftPrediction | null>(null);
   const [predicting, setPredicting] = useState<boolean>(false);
@@ -225,14 +227,26 @@ export function App() {
           </div>
 
           <div className="mast__meta">
-            <span
-              className={`status-chip ${loadingBundle ? "is-loading" : "is-ready"}`}
-              role="status"
+            <button
+              type="button"
+              className={`status-chip status-chip--btn ${loadingBundle ? "is-loading" : "is-ready"}${modelInfoOpen ? " is-open" : ""}`}
+              onClick={() => setModelInfoOpen(true)}
+              disabled={bundle === null}
+              aria-haspopup="dialog"
+              aria-expanded={modelInfoOpen}
+              title={bundle === null ? "Loading patch bundle" : "View active model details"}
             >
               <Cpu size={14} aria-hidden="true" />
               <span>Patch</span>
               <span className="measured">{patchName}</span>
-            </span>
+              {bundle !== null && (
+                <ChevronDown
+                  size={13}
+                  className="status-chip__caret"
+                  aria-hidden="true"
+                />
+              )}
+            </button>
           </div>
         </div>
       </header>
@@ -331,6 +345,13 @@ export function App() {
         allSlots={slots}
         onSelectHero={handleSelectHero}
         onClose={() => setPickerSlotIdx(null)}
+      />
+
+      <ModelInfoModal
+        isOpen={modelInfoOpen}
+        vocab={bundle?.vocab ?? null}
+        modelConfig={bundle?.modelConfig ?? null}
+        onClose={() => setModelInfoOpen(false)}
       />
     </div>
   );

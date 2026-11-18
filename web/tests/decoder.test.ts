@@ -44,6 +44,7 @@ import {
   validateBundleMetadata,
   type LoadedOracleBundle,
 } from "../src/ml/inference";
+import { buildModelInfoViewData } from "../src/components/ModelInfoModal";
 import { configureOrtEnvironment, normalizeModelBaseUrl } from "../src/ml/ortSetup";
 import type { AbilityMeta, HeroMeta, ModelConfigJson, VocabJson } from "../src/types/oracle";
 
@@ -803,5 +804,34 @@ describe("real v2 ONNX bundle inference in Node/WASM", () => {
     expect(predLate.heroes[0]!.economy.csTotal.mid).toBeGreaterThanOrEqual(
       predAuto.heroes[0]!.economy.csTotal.mid,
     );
+
+    expect(modelConfig.encoder_arch_version).toBe(4);
+    expect(modelConfig.model_summary?.total_matches).toBe(435000);
+  });
+
+  it("formats model info summary cleanly with and without optional model_summary", () => {
+    const vocab = JSON.parse(fs.readFileSync(path.join(MODELS_DIR, "vocab.json"), "utf8")) as VocabJson;
+    const modelConfig = JSON.parse(
+      fs.readFileSync(path.join(MODELS_DIR, "model_config.json"), "utf8"),
+    ) as ModelConfigJson;
+
+    const fullView = buildModelInfoViewData(vocab, modelConfig);
+    expect(fullView.patchName).toBe(modelConfig.game_version_name);
+    expect(fullView.overviewTiles.map((t) => t.value)).toContain("435,000");
+    expect(fullView.overviewTiles.map((t) => t.value)).toContain("15.0 MB");
+    expect(fullView.accuracyTiles.length).toBeGreaterThanOrEqual(5);
+    expect(
+      fullView.overviewTiles.concat(fullView.accuracyTiles).every(
+        (t) => !t.value.includes("NaN") && !t.sub.includes("NaN"),
+      ),
+    ).toBe(true);
+
+    const minimalView = buildModelInfoViewData(vocab, {
+      ...modelConfig,
+      model_summary: undefined,
+    });
+    expect(minimalView.patchName).toBe(vocab.game_version_name);
+    expect(minimalView.overviewTiles.some((t) => t.value.includes("heroes"))).toBe(true);
+    expect(minimalView.accuracyTiles).toHaveLength(0);
   });
 });

@@ -2001,6 +2001,13 @@ def test_fully_masked_branchless_loss_and_diagnostics_bundle(
     assert written["training_summary"].exists()
     assert written["history"].exists()
 
+    mc_written = json.loads(exported["model_config"].read_text(encoding="utf-8"))
+    assert mc_written["model_summary"]["total_matches"] == 12
+    assert mc_written["model_summary"]["val_matches"] == 3
+    assert mc_written["model_summary"]["num_heroes"] == sample_vocab["heroes"]["num_heroes"]
+    assert mc_written["model_summary"]["num_key_items"] == sample_vocab["items"]["num_key_items"]
+    assert mc_written["model_summary"]["bundle_size_mb"] is not None
+
     archive_path = package_export_bundle(tmp_path / "d2oracle_exports", cfg.export_dir, report_dir)
     assert archive_path.exists()
     with zipfile.ZipFile(archive_path) as zf:
