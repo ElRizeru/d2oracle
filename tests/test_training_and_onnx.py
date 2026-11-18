@@ -1785,12 +1785,15 @@ def test_stage1_pairwise_symmetry_freeze_isolation_and_two_phase_resume(
     with torch.no_grad():
         torch.nn.init.normal_(model.encoder.fm_h_bias.weight, std=0.4)
         torch.nn.init.normal_(model.encoder.fm_hp_bias.weight, std=0.4)
+        if model.encoder.win_res_mlp is not None:
+            torch.nn.init.normal_(model.encoder.win_res_mlp[-1].weight, std=0.1)
         p_a = model.encoder.compute_fm_win_logit(hero_a, rad_a, pos_a, include_map_bias=False)
         p_b = model.encoder.compute_fm_win_logit(hero_b, rad_b, pos_b, include_map_bias=False)
         assert torch.allclose(p_a, -p_b, atol=1e-5)
 
         s1_a = model.forward_stage1(hero_a, rad_a, pos_a)
         s1_b = model.forward_stage1(hero_b, rad_b, pos_b)
+        assert torch.allclose(s1_a["win_logit"], -s1_b["win_logit"], atol=1e-5)
         assert torch.allclose(s1_a["duration_quantiles"], s1_b["duration_quantiles"], atol=1e-5)
         assert torch.allclose(s1_a["lead10"], -s1_b["lead10"], atol=1e-4)
         # Swapping teams mirrors Top<->Bot lanes and flips Rad<->Dire classes [2, 1, 0]
@@ -2129,6 +2132,11 @@ def test_v4_stage1_early_stop_temperature_cal_and_loader_keys(
     parity = verify_onnx_parity(ckpt_path, cfg.export_dir, atol=1e-4)
     assert parity["passed"] is True
 
+    assert ds._tensors["hero_idx"].dtype == torch.int16
+    assert ds._tensors["skill_targets"].dtype == torch.int16
+    assert ds[0]["hero_idx"].dtype == torch.long
+    assert ds[0]["skill_targets"].dtype == torch.long
+
     # Also verify Phase-1 early stopping works cleanly & transitions to Phase 2 with consistent epochs
     cfg_es = TrainingConfig(
         checkpoint_dir=tmp_path / "ckpt_es",
@@ -2146,6 +2154,7 @@ def test_v4_stage1_early_stop_temperature_cal_and_loader_keys(
         two_phase=True,
         stage1_epochs=8,
         stage1_patience=3,
+        stage2_patience=0,
         fit_win_temperature=True,
         lr=1e-2,  # high LR on tiny 80-row constant dataset converges immediately then plateaus
         use_amp=False,
@@ -2156,3 +2165,13 @@ def test_v4_stage1_early_stop_temperature_cal_and_loader_keys(
     assert len(res_es["history"]) == 10
     assert [h["epoch"] for h in res_es["history"]] == list(range(1, 11))
     assert res_es["history"][-1]["phase"] == 2
+
+    # Also verify Phase-2 early stopping (stage2_patience) triggers cleanly on converged run
+    cfg_s2es = copy.deepcopy(cfg_es)
+    cfg_s2es.checkpoint_dir = tmp_path / "ckpt_s2es"
+    cfg_s2es.stage1_epochs = 2
+    cfg_s2es.epochs = 12
+    cfg_s2es.stage2_patience = 2
+    res_s2es = train_from_rows(train_rows, val_rows, sample_vocab, cfg_s2es)
+    assert any(h["phase"] == 2 for h in res_s2es["history"])
+    assert len(res_s2es["history"]) <= 12

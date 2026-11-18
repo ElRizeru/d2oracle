@@ -1046,6 +1046,8 @@ def train_from_datasets(
                     if "scaler_state_dict" in ckpt and amp_cuda:
                         scaler2.load_state_dict(ckpt["scaler_state_dict"])
 
+                no_improve_s2 = 0
+                min_s2_epochs = min(s2_total_epochs, max(4, s2_total_epochs // 2))
                 for epoch in range(s2_start, cfg.epochs + 1):
                     t_ep = time.monotonic()
                     phase2_ep = epoch - s2_origin_epoch + 1
@@ -1103,6 +1105,7 @@ def train_from_datasets(
                         best_loss = val_stats["loss_total"]
                         best_epoch = epoch
                         best_val_metrics = dict(val_stats)
+                        no_improve_s2 = 0
                         save_checkpoint(
                             best_path,
                             model,
@@ -1112,6 +1115,8 @@ def train_from_datasets(
                             best_stage1_score=best_stage1_score,
                             phase=2,
                         )
+                    else:
+                        no_improve_s2 += 1
 
                     save_checkpoint(
                         last_path,
@@ -1132,6 +1137,20 @@ def train_from_datasets(
                     (cfg.checkpoint_dir / "history.json").write_text(
                         json.dumps(history, indent=2), encoding="utf-8"
                     )
+
+                    if (
+                        cfg.stage2_patience > 0
+                        and phase2_ep >= min_s2_epochs
+                        and epoch < cfg.epochs
+                        and no_improve_s2 >= cfg.stage2_patience
+                    ):
+                        logger.info(
+                            "Phase 2 early stopping at epoch %d (best=%s, val_score=%.4f)",
+                            epoch,
+                            best_epoch,
+                            best_score,
+                        )
+                        break
             finally:
                 if isinstance(s2_train_loader, TensorBatchLoader):
                     s2_train_loader.release()

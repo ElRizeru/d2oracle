@@ -504,16 +504,16 @@ _LEAD_COLS: tuple[str, str] = ("radiant_gold_lead_10m", "radiant_xp_lead_10m")
 
 
 def _allocate_dataset_tensors(n: int, max_item_len: int) -> dict[str, torch.Tensor]:
-    """Allocate contiguous zero/sentinel PyTorch tensors for n matches."""
+    """Allocate contiguous compact PyTorch tensors (int16 discrete indices, float32 targets) for n matches."""
     T = int(max_item_len)
     return {
-        "hero_idx": torch.zeros((n, 10), dtype=torch.long),
-        "is_radiant": torch.zeros((n, 10), dtype=torch.long),
-        "pos_idx": torch.zeros((n, 10), dtype=torch.long),
+        "hero_idx": torch.zeros((n, 10), dtype=torch.int16),
+        "is_radiant": torch.zeros((n, 10), dtype=torch.int16),
+        "pos_idx": torch.zeros((n, 10), dtype=torch.int16),
         "radiant_win": torch.zeros((n,), dtype=torch.float32),
         "duration_min": torch.zeros((n,), dtype=torch.float32),
-        "lane_targets": torch.full((n, 3), IGNORE_INDEX, dtype=torch.long),
-        "lane5_targets": torch.full((n, 3), IGNORE_INDEX, dtype=torch.long),
+        "lane_targets": torch.full((n, 3), IGNORE_INDEX, dtype=torch.int16),
+        "lane5_targets": torch.full((n, 3), IGNORE_INDEX, dtype=torch.int16),
         "lead10_targets": torch.zeros((n, 2), dtype=torch.float32),
         "lead10_mask": torch.zeros((n, 2), dtype=torch.float32),
         "combat_rates": torch.zeros((n, 10, 4), dtype=torch.float32),
@@ -522,16 +522,21 @@ def _allocate_dataset_tensors(n: int, max_item_len: int) -> dict[str, torch.Tens
         "combat_share_mask": torch.zeros((n, 2, 4), dtype=torch.float32),
         "econ_kda_targets": torch.zeros((n, 10, 6), dtype=torch.float32),
         "econ_kda_mask": torch.zeros((n, 10, 6), dtype=torch.float32),
-        "item_input_ids": torch.full((n, 10, T), PAD_ITEM_ID, dtype=torch.long),
-        "item_target_ids": torch.full((n, 10, T), PAD_ITEM_ID, dtype=torch.long),
+        "item_input_ids": torch.full((n, 10, T), PAD_ITEM_ID, dtype=torch.int16),
+        "item_target_ids": torch.full((n, 10, T), PAD_ITEM_ID, dtype=torch.int16),
         "item_target_minutes": torch.zeros((n, 10, T), dtype=torch.float32),
         "item_time_mask": torch.zeros((n, 10, T), dtype=torch.float32),
-        "skill_targets": torch.full((n, 10, 18), IGNORE_INDEX, dtype=torch.long),
-        "talent_targets": torch.full((n, 10, 4), IGNORE_INDEX, dtype=torch.long),
+        "skill_targets": torch.full((n, 10, 18), IGNORE_INDEX, dtype=torch.int16),
+        "talent_targets": torch.full((n, 10, 4), IGNORE_INDEX, dtype=torch.int16),
         # Strictly metadata / optional loss weight — never fed to the neural network
         "sample_weight": torch.ones((n,), dtype=torch.float32),
         "is_pro_meta": torch.zeros((n,), dtype=torch.bool),
     }
+
+
+def _cast_int16_to_long(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Promote compact int16 storage tensors back to int64 on per-sample / mini-batch yield."""
+    return {k: (v.long() if v.dtype == torch.int16 else v) for k, v in batch.items()}
 
 
 def _tensors_to_numpy_views(tensors: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
@@ -813,17 +818,30 @@ def _encode_match_row_into_tensors(
     )
 
 
-def _apply_skill_mask_clamp(tensors: dict[str, torch.Tensor], skill_mask: torch.Tensor) -> None:
-    """Defense-in-depth clamp setting any illegal skill target vs skill_mask to IGNORE_INDEX."""
+def _apply_skill_mask_clamp(
+    tensors: dict[str, torch.Tensor],
+    skill_mask: torch.Tensor,
+    *,
+    chunk_size: int = 50_000,
+) -> None:
+    """Defense-in-depth chunked clamp setting any illegal skill target vs skill_mask to IGNORE_INDEX."""
     skill_targets = tensors["skill_targets"]
-    n = skill_targets.shape[0]
-    valid_skills = skill_targets != IGNORE_INDEX
-    if n > 0 and valid_skills.any():
-        hero_idx = tensors["hero_idx"]
-        h_grid = hero_idx.unsqueeze(-1).expand(-1, -1, 18)
-        l_grid = torch.arange(18, dtype=torch.long).view(1, 1, 18).expand(n, 10, 18)
-        legal_skills = skill_mask[h_grid, l_grid, skill_targets.clamp(min=0)]
-        skill_targets[valid_skills & (~legal_skills)] = IGNORE_INDEX
+    hero_idx = tensors["hero_idx"]
+    n = int(skill_targets.shape[0])
+    if n == 0:
+        return
+    l_base = torch.arange(18, dtype=torch.long).view(1, 1, 18)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        st = skill_targets[start:end]
+        valid_skills = st != IGNORE_INDEX
+        if not valid_skills.any():
+            continue
+        c_len = end - start
+        h_grid = hero_idx[start:end].long().unsqueeze(-1).expand(-1, -1, 18)
+        l_grid = l_base.expand(c_len, 10, 18)
+        legal_skills = skill_mask[h_grid, l_grid, st.long().clamp(min=0)]
+        st[valid_skills & (~legal_skills)] = IGNORE_INDEX
 
 
 class DotaDraftDataset(Dataset[dict[str, torch.Tensor]]):
@@ -887,7 +905,7 @@ class DotaDraftDataset(Dataset[dict[str, torch.Tensor]]):
         return self._num_samples
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        return {k: tensor[idx] for k, tensor in self._tensors.items()}
+        return _cast_int16_to_long({k: tensor[idx] for k, tensor in self._tensors.items()})
 
     def get_batch(
         self,
@@ -897,8 +915,8 @@ class DotaDraftDataset(Dataset[dict[str, torch.Tensor]]):
     ) -> dict[str, torch.Tensor]:
         """Gather a mini-batch directly from pre-allocated tensors (optionally pruned to keys)."""
         if keys is None:
-            return {k: tensor[indices] for k, tensor in self._tensors.items()}
-        return {k: self._tensors[k][indices] for k in keys if k in self._tensors}
+            return _cast_int16_to_long({k: tensor[indices] for k, tensor in self._tensors.items()})
+        return _cast_int16_to_long({k: self._tensors[k][indices] for k in keys if k in self._tensors})
 
 
 class TensorBatchLoader:
@@ -977,11 +995,11 @@ class TensorBatchLoader:
                 perm = perm.to(self._device)
             for start in range(0, limit, bs):
                 idx = perm[start : min(start + bs, limit)]
-                yield {k: t[idx] for k, t in src.items()}
+                yield _cast_int16_to_long({k: t[idx] for k, t in src.items()})
         else:
             for start in range(0, limit, bs):
                 sl = slice(start, min(start + bs, limit))
-                yield {k: t[sl] for k, t in src.items()}
+                yield _cast_int16_to_long({k: t[sl] for k, t in src.items()})
 
 
 @dataclass

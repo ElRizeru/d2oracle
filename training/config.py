@@ -80,10 +80,10 @@ class TrainingConfig:
     dim_feedforward: int = 384
     dropout: float = 0.1
     max_item_len: int = 12  # <BOS> + up to 11 items / <EOS>
-    stage1_pair_dim: int = 20
+    stage1_pair_dim: int = 28
     stage1_pair_dropout: float = 0.25
-    fm_l2_weight: float = 2e-4
-    stage1_win_trunk_scale: float = 0.0
+    fm_l2_weight: float = 1e-4
+    stage1_win_trunk_scale: float = 0.45
     use_stage2_block: bool = True
     eos_logit_penalty: float = 0.0
     eos_stop_prob: float = 0.25
@@ -94,6 +94,7 @@ class TrainingConfig:
     two_phase: bool = True
     stage1_epochs: int | None = None
     stage1_patience: int = 3
+    stage2_patience: int = 4
     fit_win_temperature: bool = True
     lr: float = 3e-4
     stage1_lr: float | None = None
@@ -162,9 +163,9 @@ class ModelSpec:
     dim_feedforward: int
     dropout: float
     stage2_num_layers: int = 2
-    stage1_pair_dim: int = 20
+    stage1_pair_dim: int = 28
     stage1_pair_dropout: float = 0.25
-    stage1_win_trunk_scale: float = 0.0
+    stage1_win_trunk_scale: float = 0.45
     use_stage2_block: bool = True
     eos_logit_penalty: float = 0.0
     eos_stop_prob: float = 0.25

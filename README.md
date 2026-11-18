@@ -98,7 +98,7 @@ Each of the ten slots is a hero and a position embedding summed together (side-n
 
 | What | How it's computed |
 |---|---|
-| **Win** | An L2-regularized **Bilinear Factorization Machine** (hero and hero×role biases, teammate synergy factors, antisymmetric counter factors, and a Radiant side offset), calibrated on validation with scalar temperature scaling before Stage 2 runs. |
+| **Win** | An L2-regularized **Bilinear Factorization Machine** (hero and hero×role biases, teammate synergy factors, antisymmetric counter factors, and a Radiant side offset) plus a bounded (`tanh`) antisymmetric Transformer residual for higher-order team-comp synergies, calibrated on validation with scalar temperature scaling before Stage 2 runs. |
 | **Duration** | Three numbers: a lower bound, a typical value, and an upper bound, pooled symmetrically so team swaps don't shift match length. |
 | **Lanes** | A shared mirror safelane-vs-offlane head (shared across Top and Bot) plus an antisymmetric/symmetric Mid head predict STRATZ's 5 ordinal lane levels (stomp / win / tie) and collapse them into three calibrated probabilities: Radiant wins, even, Dire wins. |
 | **Leads at 10:00** | Antisymmetric gold and XP difference between the teams. |
@@ -145,9 +145,9 @@ Duration, economy, damage and item timings are **forecasts**, so they're trained
 
 1. **Phase one** (up to 8 epochs with early stopping, `patience=3`, on pruned Stage-1 tensors): only the Stage-1 backbone, Bilinear FM and match-level heads.
 2. Then the best Phase-one checkpoint has its scalar `win_temperature` fitted on validation NLL and is **frozen**, so Stage-2 gradients can never corrupt Stage-1 calibration.
-3. **Phase two** (remaining epochs up to 24): dedicated Stage-2 backbone, hero heads and the item decoder. At first they're often given the true game situation instead of the predicted one (true result, true lanes). That share drops from 50% to 15% over training, so by the end the model is used to its own forecasts, which is all it has on the site. True duration with slight noise is mixed in throughout, so the Match pace buttons keep having an effect.
+3. **Phase two** (remaining epochs up to 20 with early stopping, `patience=4`): dedicated Stage-2 backbone, hero heads and the item decoder. At first they're often given the true game situation instead of the predicted one (true result, true lanes). That share drops from 50% to 15% over training, so by the end the model is used to its own forecasts, which is all it has on the site. True duration with slight noise is mixed in throughout, so the Match pace buttons keep having an effect.
 
-Optimiser: AdamW (separate LR/regularization groups for the Bilinear FM and Transformers) with warmup and cosine decay, mixed precision, gradient clipping, and GPU tensor caching when VRAM allows (`batch_size=512` on CUDA in Colab).
+Optimiser: AdamW (separate LR/regularization groups for the Bilinear FM and Transformers) with warmup and cosine decay, mixed precision, gradient clipping, compact `int16` tensor storage, and GPU tensor caching when VRAM allows (`batch_size=512` on CUDA in Colab).
 
 #### How quality is checked
 

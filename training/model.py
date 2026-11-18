@@ -292,10 +292,10 @@ class D2OracleEncoder(nn.Module):
         self.win_trunk_scale = float(spec.stage1_win_trunk_scale)
         if self.win_trunk_scale > 0.0:
             self.win_res_mlp = nn.Sequential(
-                nn.Linear(4 * d, 64),
+                nn.Linear(4 * d, 96),
                 nn.GELU(),
-                nn.Dropout(0.4 if spec.dropout > 0.0 else 0.0),
-                nn.Linear(64, 1),
+                nn.Dropout(0.35 if spec.dropout > 0.0 else 0.0),
+                nn.Linear(96, 1),
             )
             nn.init.zeros_(self.win_res_mlp[-1].weight)
             nn.init.zeros_(self.win_res_mlp[-1].bias)
@@ -780,10 +780,9 @@ class D2OracleEncoder(nn.Module):
         # Standalone BilinearFM (+ optional bounded antisymmetric trunk residual)
         win_logit = self.compute_fm_win_logit(hero_idx, is_radiant, pos_idx, include_map_bias=True)
         if self.win_res_mlp is not None and self.win_trunk_scale > 0.0:
-            cls_f = cls_out.detach() if not self.training else cls_out
             rp_d, dp_d = rad_pool.detach(), dire_pool.detach()
-            s_rd = self.win_res_mlp(torch.cat([cls_f, rp_d, dp_d, rp_d - dp_d], dim=-1))
-            s_dr = self.win_res_mlp(torch.cat([cls_f, dp_d, rp_d, dp_d - rp_d], dim=-1))
+            s_rd = self.win_res_mlp(torch.cat([cls_out, rp_d, dp_d, rp_d - dp_d], dim=-1))
+            s_dr = self.win_res_mlp(torch.cat([cls_out, dp_d, rp_d, dp_d - rp_d], dim=-1))
             win_logit = win_logit + self.win_trunk_scale * torch.tanh(0.5 * (s_rd - s_dr).float())
 
         temp = self.win_temperature.clamp(min=0.25, max=4.0)
