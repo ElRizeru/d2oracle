@@ -313,6 +313,9 @@ class CollectorDB:
                     "INSERT INTO players_queue (steam_account_id, source, priority, added_at) "
                     "VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(steam_account_id) DO UPDATE SET "
+                    "last_fetched_at = CASE "
+                    "WHEN excluded.priority >= 10 AND players_queue.priority < 10 THEN NULL "
+                    "ELSE players_queue.last_fetched_at END, "
                     "priority = MAX(players_queue.priority, excluded.priority)",
                     player_rows,
                 )
@@ -378,6 +381,9 @@ class CollectorDB:
                 "INSERT INTO players_queue (steam_account_id, source, priority, added_at) "
                 "VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(steam_account_id) DO UPDATE SET "
+                "last_fetched_at = CASE "
+                "WHEN excluded.priority >= 10 AND players_queue.priority < 10 THEN NULL "
+                "ELSE players_queue.last_fetched_at END, "
                 "priority = MAX(players_queue.priority, excluded.priority)",
                 rows,
             )
@@ -386,30 +392,49 @@ class CollectorDB:
     def pop_players_for_bfs(
         self, limit: int = 10, cooldown_seconds: int = 14400
     ) -> list[tuple[int, int | None]]:
-        """Select players eligible for BFS polling using partial indexes (unfetched first, then oldest cooldown)."""
+        """Select players eligible for BFS polling (active-patch priority >= 10 before fallback < 10)."""
         lim = max(0, int(limit))
         if lim == 0:
             return []
 
+        cutoff = int(time.time()) - int(cooldown_seconds)
         rows = list(
             self._conn.execute(
                 "SELECT steam_account_id, last_match_id FROM players_queue "
-                "WHERE last_fetched_at IS NULL "
+                "WHERE last_fetched_at IS NULL AND priority >= 10 "
                 "ORDER BY priority DESC, added_at ASC "
                 "LIMIT ?",
                 (lim,),
             ).fetchall()
         )
         if len(rows) < lim:
-            remaining = lim - len(rows)
-            cutoff = int(time.time()) - int(cooldown_seconds)
             rows.extend(
                 self._conn.execute(
                     "SELECT steam_account_id, last_match_id FROM players_queue "
-                    "WHERE last_fetched_at IS NOT NULL AND last_fetched_at <= ? "
+                    "WHERE last_fetched_at IS NOT NULL AND last_fetched_at <= ? AND priority >= 10 "
                     "ORDER BY last_fetched_at ASC, priority DESC, added_at ASC "
                     "LIMIT ?",
-                    (cutoff, remaining),
+                    (cutoff, lim - len(rows)),
+                ).fetchall()
+            )
+        if len(rows) < lim:
+            rows.extend(
+                self._conn.execute(
+                    "SELECT steam_account_id, last_match_id FROM players_queue "
+                    "WHERE last_fetched_at IS NULL AND priority < 10 "
+                    "ORDER BY priority DESC, added_at ASC "
+                    "LIMIT ?",
+                    (lim - len(rows),),
+                ).fetchall()
+            )
+        if len(rows) < lim:
+            rows.extend(
+                self._conn.execute(
+                    "SELECT steam_account_id, last_match_id FROM players_queue "
+                    "WHERE last_fetched_at IS NOT NULL AND last_fetched_at <= ? AND priority < 10 "
+                    "ORDER BY last_fetched_at ASC, priority DESC, added_at ASC "
+                    "LIMIT ?",
+                    (cutoff, lim - len(rows)),
                 ).fetchall()
             )
         return [

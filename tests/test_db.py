@@ -80,6 +80,13 @@ def test_db_players_queue_priority_and_patch_reset(tmp_path: Path) -> None:
         db.enqueue_players([40], source="match_bfs", priority=10)
         popped_new_patch = db.pop_players_for_bfs(limit=10, cooldown_seconds=1800)
         assert [p[0] for p in popped_new_patch] == [40, 30, 10, 20]
+
+        # Cooldown-ready active-patch players (priority >= 10) also pop ahead of unfetched low-priority seeds (< 10)
+        db.mark_player_fetched(40, 9010)
+        db._conn.execute("UPDATE players_queue SET last_fetched_at = last_fetched_at - 3600 WHERE steam_account_id = 40")
+        db._conn.commit()
+        popped_cooldown_active = db.pop_players_for_bfs(limit=10, cooldown_seconds=1800)
+        assert [p[0] for p in popped_cooldown_active] == [40, 30, 10, 20]
     finally:
         db.close()
 
