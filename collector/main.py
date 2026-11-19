@@ -11,11 +11,13 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
 from collector.clients.hf_storage import HFDatasetStorage
-from collector.clients.opendota import OpenDotaClient
+from collector.clients.opendota import OpenDotaClient, OpenDotaTransientError
+from collector.clients.steam import SteamAPIError, SteamClient, SteamTransientError
 from collector.clients.stratz import (
     StratzBatchFallbackError,
     StratzClient,
@@ -29,9 +31,15 @@ from collector.patch_manager import ActivePatchContext, PatchManager
 from collector.rate_limit import (
     QuotaExhaustedError,
     build_opendota_rate_limiter,
+    build_steam_rate_limiter,
     build_stratz_rate_limiter,
 )
-from collector.validator import validate_and_transform_match
+from collector.validator import (
+    find_missing_key_items_from_finals,
+    prevalidate_stratz_match,
+    validate_and_transform_match,
+)
+from shared.constants import PRO_GAME_MODE
 
 logger = logging.getLogger("d2oracle.collector")
 STRATZ_MATCH_BATCH_SIZE: int = 20
@@ -65,6 +73,7 @@ class CollectorRunner:
         hf_storage: HFDatasetStorage,
         patch_manager: PatchManager,
         discovery: DiscoveryEngine,
+        steam: SteamClient | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.settings = settings
@@ -74,11 +83,13 @@ class CollectorRunner:
         self.hf_storage = hf_storage
         self.patch_manager = patch_manager
         self.discovery = discovery
+        self.steam = steam
         self._clock = clock
         self._stop_requested = False
         self._stop_event = asyncio.Event()
         self._last_pro_discovery_at: float | None = None
         self._last_public_discovery_at: float | None = None
+        self._last_steam_live_discovery_at: float | None = None
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -93,26 +104,39 @@ class CollectorRunner:
     async def _run_periodic_discovery(
         self, ctx: ActivePatchContext, *, pending_count: int
     ) -> None:
-        """Run periodic pro discovery always, and public OpenDota discovery only when queue is low."""
+        """Run periodic pro + Steam live discovery, and public OpenDota discovery when queue is low."""
         now = self._clock()
+        effective_start = max(ctx.as_of_datetime, ctx.min_start_datetime)
+
         if (
             self._last_pro_discovery_at is None
             or (now - self._last_pro_discovery_at)
             >= self.settings.pro_discovery_interval_seconds
         ):
-            await self.discovery.discover_pro_matches(ctx.as_of_datetime)
+            await self.discovery.discover_pro_matches(effective_start)
             self._last_pro_discovery_at = self._clock()
+
+        if self.steam is not None and (
+            self._last_steam_live_discovery_at is None
+            or (now - self._last_steam_live_discovery_at)
+            >= self.settings.steam_live_discovery_interval_seconds
+        ):
+            await self.discovery.discover_steam_live_seeds()
+            self._last_steam_live_discovery_at = self._clock()
 
         if pending_count < PUBLIC_DISCOVERY_PENDING_THRESHOLD and (
             self._last_public_discovery_at is None
             or (now - self._last_public_discovery_at)
             >= self.settings.public_discovery_interval_seconds
         ):
-            await self.discovery.discover_public_seeds(ctx.as_of_datetime)
+            await self.discovery.discover_public_seeds(effective_start)
             self._last_public_discovery_at = self._clock()
 
     async def _ensure_queue_has_matches(self, ctx: ActivePatchContext) -> int:
         cooldown = self.settings.match_retry_cooldown_seconds
+        effective_start = max(ctx.as_of_datetime, ctx.min_start_datetime)
+        stratz_gv_ids = ctx.stratz_gv_ids or (ctx.gv_id,)
+
         pending_count = self.db.count_pending_matches(retry_cooldown_seconds=cooldown)
         await self._run_periodic_discovery(ctx, pending_count=pending_count)
 
@@ -120,48 +144,146 @@ class CollectorRunner:
         if pending_count >= PUBLIC_DISCOVERY_PENDING_THRESHOLD:
             return pending_count
 
-        # 1. Snowball BFS from already known Immortal players (fresh <=14d matches)
-        if self.db.has_players():
-            await self.discovery.discover_bfs_from_players(
-                ctx.gv_id, active_gv_as_of=ctx.as_of_datetime
-            )
+        if not self.db.has_players() and self.steam is not None:
+            await self.discovery.discover_steam_live_seeds()
+            self._last_steam_live_discovery_at = self._clock()
 
-        pending_count = self.db.count_pending_matches(retry_cooldown_seconds=cooldown)
-        if pending_count < PUBLIC_DISCOVERY_PENDING_THRESHOLD:
-            # 2. Immediate fallback seed if queue is still low
-            await self.discovery.discover_public_seeds(ctx.as_of_datetime)
-            self._last_public_discovery_at = self._clock()
-            await self.discovery.discover_pro_matches(ctx.as_of_datetime)
-            self._last_pro_discovery_at = self._clock()
+        # 1. Snowball BFS from already known Immortal players
+        if self.db.has_players():
+            bfs_added = await self.discovery.discover_bfs_from_players(
+                ctx.gv_id,
+                active_gv_as_of=effective_start,
+                stratz_gv_ids=stratz_gv_ids,
+            )
+            pending_count = self.db.count_pending_matches(retry_cooldown_seconds=cooldown)
+            if (
+                bfs_added == 0
+                and pending_count < PUBLIC_DISCOVERY_PENDING_THRESHOLD
+                and self.steam is not None
+            ):
+                await self.discovery.discover_steam_player_history(effective_start)
 
         pending_count = self.db.count_pending_matches(retry_cooldown_seconds=cooldown)
         if pending_count == 0:
-            # 3. Backup seed from leaderboard tail
+            # 2. Backup seed from leaderboard tail (+ interval-gated Steam live seeds)
             await self.discovery.discover_leaderboard_tail()
+            now_steam = self._clock()
+            if self.steam is not None and (
+                self._last_steam_live_discovery_at is None
+                or (now_steam - self._last_steam_live_discovery_at)
+                >= self.settings.steam_live_discovery_interval_seconds
+            ):
+                await self.discovery.discover_steam_live_seeds()
+                self._last_steam_live_discovery_at = self._clock()
             await self.discovery.discover_bfs_from_players(
-                ctx.gv_id, active_gv_as_of=ctx.as_of_datetime
+                ctx.gv_id,
+                active_gv_as_of=effective_start,
+                stratz_gv_ids=stratz_gv_ids,
             )
             pending_count = self.db.count_pending_matches(retry_cooldown_seconds=cooldown)
 
         return pending_count
 
+    async def _maybe_fetch_opendota_for_missing_items(
+        self,
+        match_id: int,
+        stratz_match: dict[str, Any],
+        steam_match: dict[str, Any] | None,
+        vocab: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Fetch OpenDota match details on demand when Steam finals hold key items omitted by STRATZ."""
+        if steam_match is None:
+            return None
+        is_pro = (stratz_match.get("leagueId") is not None) and (
+            str(stratz_match.get("gameMode") or "") == PRO_GAME_MODE
+        )
+        if not find_missing_key_items_from_finals(stratz_match, steam_match, vocab):
+            return None
+        if is_pro:
+            if not self.opendota.rate_limiter.has_spare_capacity(
+                min_day_remaining=100, min_minute_remaining=5
+            ):
+                return None
+        elif not self.opendota.rate_limiter.has_spare_capacity(
+            min_day_remaining=400, min_minute_remaining=15
+        ):
+            return None
+        try:
+            return await self.opendota.get_match(match_id)
+        except (QuotaExhaustedError, OpenDotaTransientError, httpx.HTTPError) as exc:
+            logger.debug(
+                "Optional OpenDota new-item lookup skipped for match %d (is_pro=%s): %s",
+                match_id,
+                is_pro,
+                exc,
+            )
+            return None
+
     async def _handle_match_payload(
         self,
         match_id: int,
         source: str,
-        raw_match: dict[str, object] | None,
+        raw_match: dict[str, Any] | None,
         *,
         ctx: ActivePatchContext,
         limit: int | None,
         collected_so_far: int,
     ) -> tuple[int, int, int]:
         """Validate and persist one match outcome; return (collected_d, rejected_d, retried_d)."""
+        allowed_gvs = ctx.stratz_gv_ids or (ctx.gv_id,)
+        pre = prevalidate_stratz_match(
+            raw_match,
+            active_gv_id=ctx.gv_id,
+            allowed_gv_ids=allowed_gvs,
+            min_start_datetime=ctx.min_start_datetime,
+            max_start_datetime=ctx.max_start_datetime,
+            require_stratz_abilities=(self.steam is None),
+        )
+        if not pre.valid or raw_match is None:
+            if pre.retryable:
+                max_attempts = (
+                    1 if source == "opendota_public" and pre.reason == "unparsed" else 2
+                )
+                new_status = self.db.mark_match_retry(
+                    match_id, pre.reason or "retry", max_attempts=max_attempts
+                )
+                return (0, 1, 0) if new_status == "rejected" else (0, 0, 1)
+            self.db.mark_match_rejected(match_id, pre.reason or "invalid")
+            return 0, 1, 0
+
+        steam_match: dict[str, Any] | None = None
+        if self.steam is not None:
+            seq_num = raw_match.get("sequenceNum")
+            if not seq_num or int(seq_num) <= 0:
+                new_status = self.db.mark_match_retry(
+                    match_id, "missing_steam_match", max_attempts=2
+                )
+                return (0, 1, 0) if new_status == "rejected" else (0, 0, 1)
+            steam_map = await self.steam.get_matches_for_seq_nums(
+                {int(seq_num): match_id},
+                max_concurrency=self.settings.steam_match_concurrency,
+            )
+            steam_match = steam_map.get(match_id)
+            if steam_match is None:
+                new_status = self.db.mark_match_retry(
+                    match_id, "missing_steam_match", max_attempts=2
+                )
+                return (0, 1, 0) if new_status == "rejected" else (0, 0, 1)
+
+        od_match = await self._maybe_fetch_opendota_for_missing_items(
+            match_id, raw_match, steam_match, ctx.vocab
+        )
         result = validate_and_transform_match(
             raw_match,
             active_gv_id=ctx.gv_id,
             active_gv_name=ctx.gv_name,
             source=source,
             vocab=ctx.vocab,
+            steam_match=steam_match,
+            opendota_match=od_match,
+            allowed_gv_ids=allowed_gvs,
+            min_start_datetime=ctx.min_start_datetime,
+            max_start_datetime=ctx.max_start_datetime,
         )
 
         if result.valid and result.record is not None:
@@ -274,7 +396,7 @@ class CollectorRunner:
     async def _process_batch_chunk_results(
         self,
         chunk: list[tuple[int, str, int]],
-        batch_matches: dict[int, dict[str, object] | None],
+        batch_matches: dict[int, dict[str, Any] | None],
         failed_ids: set[int],
         *,
         ctx: ActivePatchContext,
@@ -284,24 +406,86 @@ class CollectorRunner:
         retried: int,
         batch_gql_errors: int,
     ) -> tuple[int, int, int, int]:
-        """Validate a batch chunk and persist all outcomes in one SQLite transaction."""
-        to_collect: list[tuple[int, dict[str, object]]] = []
+        """Pre-validate STRATZ batch, enrich with Steam + OpenDota, and persist atomically."""
+        to_collect: list[tuple[int, dict[str, Any]]] = []
         collect_logs: list[tuple[int, str, bool]] = []
         to_reject: list[tuple[int, str]] = []
         to_retry: list[tuple[int, str, int]] = []
         bfs_players: list[int] = []
         fallback_items: list[tuple[int, str, int]] = []
+        prevalid_items: list[tuple[int, str, dict[str, Any]]] = []
+
+        allowed_gvs = ctx.stratz_gv_ids or (ctx.gv_id,)
 
         for match_id, source, attempts in chunk:
             if match_id in failed_ids:
                 fallback_items.append((match_id, source, attempts))
                 continue
+            raw_match = batch_matches.get(match_id)
+            pre = prevalidate_stratz_match(
+                raw_match,
+                active_gv_id=ctx.gv_id,
+                allowed_gv_ids=allowed_gvs,
+                min_start_datetime=ctx.min_start_datetime,
+                max_start_datetime=ctx.max_start_datetime,
+                require_stratz_abilities=(self.steam is None),
+            )
+            if not pre.valid or raw_match is None:
+                if pre.retryable:
+                    max_att = (
+                        1 if source == "opendota_public" and pre.reason == "unparsed" else 2
+                    )
+                    to_retry.append((match_id, pre.reason or "retry", max_att))
+                else:
+                    to_reject.append((match_id, pre.reason or "invalid"))
+                continue
+            prevalid_items.append((match_id, source, raw_match))
+
+        steam_by_mid: dict[int, dict[str, Any]] = {}
+        steam_ready_items: list[tuple[int, str, dict[str, Any], dict[str, Any] | None]] = []
+        if self.steam is not None and prevalid_items:
+            seq_to_mid: dict[int, int] = {}
+            with_seq: list[tuple[int, str, dict[str, Any]]] = []
+            for match_id, source, raw_match in prevalid_items:
+                seq_num = raw_match.get("sequenceNum")
+                if not seq_num or int(seq_num) <= 0:
+                    to_retry.append((match_id, "missing_steam_match", 2))
+                else:
+                    seq_to_mid[int(seq_num)] = match_id
+                    with_seq.append((match_id, source, raw_match))
+
+            if seq_to_mid:
+                steam_by_mid = await self.steam.get_matches_for_seq_nums(
+                    seq_to_mid,
+                    max_concurrency=self.settings.steam_match_concurrency,
+                )
+
+            for match_id, source, raw_match in with_seq:
+                steam_m = steam_by_mid.get(match_id)
+                if steam_m is None:
+                    to_retry.append((match_id, "missing_steam_match", 2))
+                else:
+                    steam_ready_items.append((match_id, source, raw_match, steam_m))
+        else:
+            steam_ready_items = [
+                (mid, src, raw_m, None) for mid, src, raw_m in prevalid_items
+            ]
+
+        for match_id, source, raw_match, steam_match in steam_ready_items:
+            od_match = await self._maybe_fetch_opendota_for_missing_items(
+                match_id, raw_match, steam_match, ctx.vocab
+            )
             result = validate_and_transform_match(
-                batch_matches.get(match_id),
+                raw_match,
                 active_gv_id=ctx.gv_id,
                 active_gv_name=ctx.gv_name,
                 source=source,
                 vocab=ctx.vocab,
+                steam_match=steam_match,
+                opendota_match=od_match,
+                allowed_gv_ids=allowed_gvs,
+                min_start_datetime=ctx.min_start_datetime,
+                max_start_datetime=ctx.max_start_datetime,
             )
             if result.valid and result.record is not None:
                 to_collect.append((match_id, result.record))
@@ -418,19 +602,22 @@ class CollectorRunner:
                     self.settings.patch_check_interval_seconds
                 ):
                     initial_sync = ctx is None
-                    ctx = await self.patch_manager.sync_patch()
+                    ctx = await self.patch_manager.sync_patch(skip_hf_upload=no_upload)
                     if initial_sync:
                         logger.info(
-                            "Collector active on patch %s (gv=%d, asOf=%d), dry_run=%s, limit=%s",
+                            "Collector active on patch %s (gv=%d, asOf=%d, valve_ahead=%s, steam=%s), dry_run=%s, limit=%s",
                             ctx.gv_name,
                             ctx.gv_id,
                             ctx.as_of_datetime,
+                            ctx.valve_ahead,
+                            self.steam is not None,
                             dry_run,
                             limit,
                         )
                     elif ctx.switched:
                         self._last_pro_discovery_at = None
                         self._last_public_discovery_at = None
+                        self._last_steam_live_discovery_at = None
                         logger.info(
                             "Switched cleanly to new patch %s (gv=%d)",
                             ctx.gv_name,
@@ -546,7 +733,18 @@ class CollectorRunner:
                 logger.info("Sleeping %.0fs until quota recovers", sleep_for)
                 await self._sleep_interruptible(sleep_for)
 
-            except (StratzGraphQLError, StratzTransientError, httpx.HTTPError) as exc:
+            except (
+                StratzGraphQLError,
+                StratzTransientError,
+                SteamTransientError,
+                SteamAPIError,
+                httpx.HTTPError,
+            ) as exc:
+                err_text = str(exc)
+                if isinstance(exc, SteamAPIError) and (
+                    "HTTP 401" in err_text or "HTTP 403" in err_text
+                ):
+                    raise
                 consecutive_errors += 1
                 if once:
                     logger.error("Collector failed in --once mode: %s", exc)
@@ -622,6 +820,8 @@ async def _run_from_args(args: argparse.Namespace) -> int:
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     limit = args.limit
     if args.dry_run and limit is None:
@@ -646,6 +846,23 @@ async def _run_from_args(args: argparse.Namespace) -> int:
             http_client=http_client,
         )
         opendota = OpenDotaClient(rate_limiter=od_rl, http_client=http_client)
+        steam: SteamClient | None = None
+        if settings.steam_api_key is not None:
+            steam_rl = build_steam_rate_limiter(
+                rps=settings.steam_rps_limit,
+                rpm=settings.steam_rpm_limit,
+                rpd=settings.steam_rpd_limit,
+            )
+            steam = SteamClient(
+                api_key=settings.steam_api_key.get_secret_value(),
+                rate_limiter=steam_rl,
+                http_client=http_client,
+            )
+        else:
+            logger.warning(
+                "STEAM_API_KEY is not set; running in STRATZ-only fallback mode (new-hero talents may be incomplete)"
+            )
+
         hf_storage = HFDatasetStorage(
             repo_id=settings.hf_repo_id,
             token=settings.hf_token.get_secret_value(),
@@ -663,6 +880,7 @@ async def _run_from_args(args: argparse.Namespace) -> int:
             db=db,
             stratz=stratz,
             opendota=opendota,
+            steam=steam,
             public_min_delay_seconds=settings.public_match_min_delay_seconds,
             public_max_delay_seconds=settings.public_match_max_delay_seconds,
             pro_min_delay_seconds=settings.pro_match_min_delay_seconds,
@@ -678,6 +896,7 @@ async def _run_from_args(args: argparse.Namespace) -> int:
             hf_storage=hf_storage,
             patch_manager=patch_manager,
             discovery=discovery,
+            steam=steam,
         )
 
         loop = asyncio.get_running_loop()

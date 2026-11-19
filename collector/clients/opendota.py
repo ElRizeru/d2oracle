@@ -62,6 +62,8 @@ class OpenDotaClient:
                     raise OpenDotaTransientError("OpenDota HTTP 429")
                 if resp.status_code >= 500:
                     raise OpenDotaTransientError(f"OpenDota HTTP {resp.status_code}")
+                if resp.status_code == 404:
+                    return None
                 resp.raise_for_status()
                 return resp.json()
 
@@ -87,3 +89,8 @@ class OpenDotaClient:
             params["less_than_match_id"] = int(less_than_match_id)
         data = await self._get_json("proMatches", params=params or None)
         return list(data) if isinstance(data, list) else []
+
+    async def get_match(self, match_id: int) -> dict[str, Any] | None:
+        """Fetch parsed match details from OpenDota (used on demand for new-patch item purchases)."""
+        data = await self._get_json(f"matches/{int(match_id)}")
+        return dict(data) if isinstance(data, dict) else None

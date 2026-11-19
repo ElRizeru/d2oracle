@@ -362,3 +362,231 @@ async def test_hf_read_latest_manifest_no_retry_on_not_found_and_retries_transie
     assert db.count_buffered_matches(190) == 0
     assert list((tmp_path / "shards").glob("*.parquet")) == []
     db.close()
+
+
+async def test_valve_ahead_patch_switch_resets_pro_backfill_and_continues_on_stratz_catchup(
+    tmp_path: Path, sample_vocab
+) -> None:
+    from shared.constants import DOTA2_DATAFEED_BASE_URL
+
+    db = CollectorDB(tmp_path / "valve_ahead.sqlite3")
+    hf = InMemoryHFStorage()
+    odota_payload = make_dotaconstants_payload()
+
+    db.set_active_patch(190, "7.41f", 1789430400)
+    db.set_meta("opendota_pro_backfill_done", "1")
+    db.set_meta("opendota_pro_backfill_cursor", "9090000")
+    await hf.upload_vocab(190, "7.41f", sample_vocab)
+    await hf.update_manifest_for_patch(190, "7.41f", 1789430400, "data/gv_190_7.41f/vocab.json")
+
+    stratz_versions = [
+        {"id": 190, "name": "7.41f", "asOfDateTime": 1789430400},
+    ]
+    consts_190 = make_stratz_constants_payload(gv_id=190, gv_name="7.41f", as_of=1789430400)
+
+    def stratz_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        q = body["query"]
+        if "GetGameVersions" in q:
+            return httpx.Response(200, json={"data": {"constants": {"gameVersions": stratz_versions}}})
+        if "GetConstants" in q:
+            assert body["variables"]["gv"] == 190
+            return httpx.Response(200, json={"data": {"constants": consts_190}})
+        raise AssertionError(f"Unexpected query: {q}")
+
+    def valve_handler(request: httpx.Request) -> httpx.Response:
+        ep = request.url.path.rsplit("/", 1)[-1]
+        if ep == "patchnoteslist":
+            return httpx.Response(
+                200,
+                json={
+                    "patches": [
+                        {"patch_number": "7.41f", "patch_timestamp": 1789455600},
+                        {"patch_number": "7.42", "patch_timestamp": 1794988800},
+                    ]
+                },
+            )
+        if ep == "herolist":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"heroes": [{"id": 155, "name": "npc_dota_hero_largo", "name_loc": "Largo"}]}}},
+            )
+        if ep == "herodata":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "data": {
+                            "heroes": [
+                                {
+                                    "id": 155,
+                                    "name": "npc_dota_hero_largo",
+                                    "name_loc": "Largo",
+                                    "primary_attr": 0,
+                                    "attack_capability": 1,
+                                    "abilities": [],
+                                    "talents": [{"id": 8001 + i, "name": f"special_bonus_unique_largo_{i+1}", "name_loc": f"Tal {i+1}"} for i in range(8)],
+                                }
+                            ]
+                        }
+                    }
+                },
+            )
+        if ep == "itemlist":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"itemabilities": [{"id": 1, "name": "item_blink", "neutral_item_tier": -1, "recipes": []}]}}},
+            )
+        if ep == "itemdata":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"items": [{"id": 1, "name": "item_blink", "name_loc": "Blink Dagger", "item_cost": 2250, "item_quality": 1, "item_neutral_tier": 4294967295}]}}},
+            )
+        if ep == "abilitylist":
+            return httpx.Response(200, json={"result": {"data": {"itemabilities": []}}})
+        if ep == "patchnotes":
+            return httpx.Response(200, json={"items": []})
+        raise AssertionError(f"Unexpected Valve path: {ep}")
+
+    with respx.mock(assert_all_called=False) as router:
+        router.post(STRATZ_GRAPHQL_URL).mock(side_effect=stratz_handler)
+        router.get(url__startswith=DOTA2_DATAFEED_BASE_URL).mock(side_effect=valve_handler)
+        _mock_dotaconstants(odota_payload)
+        async with httpx.AsyncClient() as client:
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            pm = PatchManager(
+                target_game_version="auto",
+                db=db,
+                stratz=stratz,
+                hf_storage=hf,  # type: ignore[arg-type]
+                http_client=client,
+                constants_cache_dir=tmp_path / "constants",
+                parquet_dir=tmp_path / "shards",
+                wall_clock=lambda: 1795043000.0,
+            )
+            ctx = await pm.sync_patch()
+
+            assert ctx.switched is True
+            assert ctx.gv_id == 191
+            assert ctx.gv_name == "7.42"
+            assert ctx.valve_ahead is True
+            assert ctx.stratz_gv_ids == (190, 191)
+            assert ctx.min_start_datetime == 1794988800 + 43200
+            # Pro backfill flags cleared on patch switch
+            assert db.get_meta("opendota_pro_backfill_done") is None
+            assert db.get_meta("opendota_pro_backfill_cursor") is None
+
+            # Enqueue a 7.42 match, then simulate STRATZ catching up and publishing gv 191
+            db.enqueue_matches([(9096009999, "bfs")])
+            stratz_versions.append({"id": 191, "name": "7.42", "asOfDateTime": 1795050000})
+            ctx2 = await pm.sync_patch()
+
+            assert ctx2.switched is False
+            assert ctx2.gv_id == 191
+            assert ctx2.valve_ahead is False
+            assert ctx2.stratz_gv_ids == (191,)
+            assert [m[0] for m in db.pop_pending_matches()] == [9096009999]
+
+    db.close()
+
+
+async def test_sync_patch_skip_hf_upload_and_pre_deploy_lookback(tmp_path: Path) -> None:
+    from shared.constants import DOTA2_DATAFEED_BASE_URL
+
+    db = CollectorDB(tmp_path / "no_upload.sqlite3")
+    hf = InMemoryHFStorage()
+    odota_payload = make_dotaconstants_payload()
+
+    stratz_versions = [{"id": 190, "name": "7.41f", "asOfDateTime": 1789430400}]
+    consts_190 = make_stratz_constants_payload(gv_id=190, gv_name="7.41f", as_of=1789430400)
+
+    def stratz_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        q = body["query"]
+        if "GetGameVersions" in q:
+            return httpx.Response(200, json={"data": {"constants": {"gameVersions": stratz_versions}}})
+        if "GetConstants" in q:
+            return httpx.Response(200, json={"data": {"constants": consts_190}})
+        raise AssertionError(f"Unexpected query: {q}")
+
+    def valve_handler(request: httpx.Request) -> httpx.Response:
+        ep = request.url.path.rsplit("/", 1)[-1]
+        if ep == "patchnoteslist":
+            return httpx.Response(
+                200,
+                json={
+                    "patches": [
+                        {"patch_number": "7.41f", "patch_timestamp": 1789455600},
+                        {"patch_number": "7.42", "patch_timestamp": 1794988800},
+                    ]
+                },
+            )
+        if ep == "herolist":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"heroes": [{"id": 155, "name": "npc_dota_hero_largo", "name_loc": "Largo"}]}}},
+            )
+        if ep == "herodata":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "data": {
+                            "heroes": [
+                                {
+                                    "id": 155,
+                                    "name": "npc_dota_hero_largo",
+                                    "name_loc": "Largo",
+                                    "primary_attr": 0,
+                                    "attack_capability": 1,
+                                    "abilities": [],
+                                    "talents": [{"id": 8001 + i, "name": f"special_bonus_unique_largo_{i+1}", "name_loc": f"Tal {i+1}"} for i in range(8)],
+                                }
+                            ]
+                        }
+                    }
+                },
+            )
+        if ep == "itemlist":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"itemabilities": [{"id": 1, "name": "item_blink", "neutral_item_tier": -1, "recipes": []}]}}},
+            )
+        if ep == "itemdata":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"items": [{"id": 1, "name": "item_blink", "name_loc": "Blink Dagger", "item_cost": 2250, "item_quality": 1, "item_neutral_tier": 4294967295}]}}},
+            )
+        if ep == "abilitylist":
+            return httpx.Response(200, json={"result": {"data": {"itemabilities": []}}})
+        if ep == "patchnotes":
+            return httpx.Response(200, json={"items": []})
+        raise AssertionError(f"Unexpected Valve path: {ep}")
+
+    # Wall clock is 10000s after patch_timestamp (< 43200s deploy floor -> 7200s lookback applies)
+    now_ts = 1794988800 + 10000
+    with respx.mock(assert_all_called=False) as router:
+        router.post(STRATZ_GRAPHQL_URL).mock(side_effect=stratz_handler)
+        router.get(url__startswith=DOTA2_DATAFEED_BASE_URL).mock(side_effect=valve_handler)
+        _mock_dotaconstants(odota_payload)
+        async with httpx.AsyncClient() as client:
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            pm = PatchManager(
+                target_game_version="auto",
+                db=db,
+                stratz=stratz,
+                hf_storage=hf,  # type: ignore[arg-type]
+                http_client=client,
+                constants_cache_dir=tmp_path / "constants",
+                parquet_dir=tmp_path / "shards",
+                wall_clock=lambda: float(now_ts),
+            )
+            ctx = await pm.sync_patch(skip_hf_upload=True)
+
+            assert ctx.gv_id == 191
+            assert ctx.gv_name == "7.42"
+            assert ctx.min_start_datetime == now_ts - 7200
+            assert hf.files == {}
+            assert (tmp_path / "constants" / "vocab_191.json").exists()
+
+    db.close()

@@ -240,3 +240,59 @@ async def test_stratz_hour_soft_reserve_and_pace_cap() -> None:
     await limiter.acquire()
     assert len(clock.sleeps) == 2
     assert 0.0 < clock.sleeps[1] <= 2.05
+
+
+async def test_has_spare_capacity_tracks_local_remote_cooldown_and_utc_rollover() -> None:
+    mono = FakeClock(initial=1000.0)
+    utc = FakeClock(initial=1794872000.0)  # 1600s before UTC midnight
+
+    od = build_opendota_rate_limiter(rpm=20, rpd=410, clock=mono, sleeper=mono.sleep)
+    od._utc_clock = utc  # type: ignore[attr-defined]
+
+    # Fresh limiter satisfies both thresholds
+    assert od.has_spare_capacity(min_day_remaining=400, min_minute_remaining=15) is True
+
+    # Burn 5 calls -> 15 left in minute, 405 left in day
+    for _ in range(5):
+        await od.acquire()
+    assert od.has_spare_capacity(min_day_remaining=400, min_minute_remaining=15) is True
+
+    # 1 more call drops minute remaining to 14 -> below pub minute floor (15), still above pro floor (5)
+    await od.acquire()
+    assert od.has_spare_capacity(min_day_remaining=400, min_minute_remaining=15) is False
+    assert od.has_spare_capacity(min_day_remaining=100, min_minute_remaining=5) is True
+
+    # Advance past 60s minute window -> minute resets cleanly
+    mono.now += 61.0
+    assert od.has_spare_capacity(min_day_remaining=400, min_minute_remaining=15) is True
+
+    # Burn 5 more -> 399 left in day (< 400 pub floor, >= 100 pro floor)
+    for _ in range(5):
+        await od.acquire()
+    assert od.has_spare_capacity(min_day_remaining=400, min_minute_remaining=15) is False
+    assert od.has_spare_capacity(min_day_remaining=100, min_minute_remaining=5) is True
+
+    # Remote header ceiling constrains effective remaining even when local count is low
+    od_hdr = build_opendota_rate_limiter(rpm=50, rpd=1000, clock=mono, sleeper=mono.sleep)
+    od_hdr._utc_clock = utc  # type: ignore[attr-defined]
+    od_hdr.update_from_headers(
+        {"x-rate-limit-remaining-minute": "20", "x-rate-limit-remaining-day": "250"}
+    )
+    assert od_hdr.has_spare_capacity(min_day_remaining=400, min_minute_remaining=15) is False
+    assert od_hdr.has_spare_capacity(min_day_remaining=100, min_minute_remaining=5) is True
+
+    # Explicit 429 cooldown blocks all spare capacity until cooldown expires
+    od_hdr.notify_rate_limited(default_wait=10.0)
+    assert od_hdr.has_spare_capacity(min_day_remaining=1, min_minute_remaining=1) is False
+    mono.now += 11.0
+    assert od_hdr.has_spare_capacity(min_day_remaining=100, min_minute_remaining=5) is True
+
+    # UTC calendar day rollover clears utc_day_count
+    stratz = build_stratz_rate_limiter(
+        rps=50, rpm=100, rph=1000, rpd=410, clock=mono, utc_clock=utc, sleeper=mono.sleep
+    )
+    for _ in range(15):
+        await stratz.acquire()
+    assert stratz.has_spare_capacity(min_day_remaining=400) is False
+    utc.now += 1700.0
+    assert stratz.has_spare_capacity(min_day_remaining=400) is True

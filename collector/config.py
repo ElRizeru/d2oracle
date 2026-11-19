@@ -19,6 +19,7 @@ class CollectorSettings(BaseSettings):
 
     stratz_token: SecretStr
     hf_token: SecretStr
+    steam_api_key: SecretStr | None = None
     hf_repo_id: str = "rizeru/d2oracle-data"
 
     target_game_version: str = "auto"
@@ -31,6 +32,7 @@ class CollectorSettings(BaseSettings):
     patch_check_interval_seconds: int = Field(default=3600, ge=60)
     pro_discovery_interval_seconds: int = Field(default=1800, ge=60)
     public_discovery_interval_seconds: int = Field(default=1800, ge=60)
+    steam_live_discovery_interval_seconds: int = Field(default=600, ge=60)
 
     # Safe STRATZ rate ceilings (hard API limits: 8/s, 150/m, 1500/h, 15000/d)
     stratz_rps_limit: int = Field(default=6, ge=1, le=8)
@@ -41,6 +43,12 @@ class CollectorSettings(BaseSettings):
     # Safe OpenDota rate ceilings (unauthenticated limits: 60/m, 3000/d)
     opendota_rpm_limit: int = Field(default=50, ge=1, le=60)
     opendota_rpd_limit: int = Field(default=2800, ge=1, le=3000)
+
+    # Safe Steam Web API rate ceilings (100,000/day hard limit)
+    steam_rps_limit: int = Field(default=5, ge=1, le=20)
+    steam_rpm_limit: int = Field(default=240, ge=1, le=600)
+    steam_rpd_limit: int = Field(default=90000, ge=1, le=100000)
+    steam_match_concurrency: int = Field(default=4, ge=1, le=10)
 
     # Discovery lag windows so STRATZ has time to parse matches
     public_match_min_delay_seconds: int = Field(default=3600, ge=0)
@@ -57,6 +65,13 @@ class CollectorSettings(BaseSettings):
     match_retry_cooldown_seconds: int = Field(default=1800, ge=0, le=86400)
 
     log_level: str = "INFO"
+
+    @field_validator("steam_api_key", mode="before")
+    @classmethod
+    def normalize_blank_steam_key(cls, v: object) -> object:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     @field_validator("target_game_version")
     @classmethod

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -89,6 +90,7 @@ MATCH_SELECTION_FIELDS = """
     didRadiantWin
     durationSeconds
     startDateTime
+    sequenceNum
     gameVersionId
     gameMode
     lobbyType
@@ -313,7 +315,7 @@ class StratzClient:
     async def get_players_matches(
         self,
         steam_account_ids: list[int],
-        game_version_id: int,
+        game_version_id: int | Sequence[int],
         *,
         take: int = 100,
         start_datetime: int | None = None,
@@ -324,6 +326,16 @@ class StratzClient:
         if len(steam_account_ids) > 10:
             raise ValueError("STRATZ player batch query supports at most 10 players at once")
 
+        if isinstance(game_version_id, int):
+            gv_ids = [int(game_version_id)]
+        else:
+            gv_ids = [int(x) for x in game_version_id]
+        if not gv_ids:
+            raise ValueError("game_version_id must contain at least one game version ID")
+
+        multi_gv = len(gv_ids) > 1
+        gv_filter = "gameVersionIds: $gvs" if multi_gv else "gameVersionIds: [$gv]"
+        gv_decl = "$gvs: [Int]" if multi_gv else "$gv: Int!"
         use_since = start_datetime is not None and int(start_datetime) > 0
         since_clause = ", startDateTime: $since" if use_since else ""
         aliases: list[str] = []
@@ -331,15 +343,19 @@ class StratzClient:
             aliases.append(
                 f"p{idx}: player(steamAccountId: {int(sid)}) {{ "
                 f"matches(request: {{ take: {int(take)}, isParsed: true, "
-                f"gameVersionIds: [$gv], lobbyTypeIds: [7], bracketIds: [8]{since_clause} }}) {{ "
+                f"{gv_filter}, lobbyTypeIds: [7], bracketIds: [8]{since_clause} }}) {{ "
                 f"id startDateTime parsedDateTime durationSeconds gameMode }} }}"
             )
         if use_since:
-            query = f"query GetPlayersMatches($gv: Int!, $since: Long) {{ {' '.join(aliases)} }}"
-            variables: dict[str, Any] = {"gv": int(game_version_id), "since": int(start_datetime)}
+            query = f"query GetPlayersMatches({gv_decl}, $since: Long) {{ {' '.join(aliases)} }}"
+            variables: dict[str, Any] = (
+                {"gvs": gv_ids, "since": int(start_datetime)}
+                if multi_gv
+                else {"gv": gv_ids[0], "since": int(start_datetime)}
+            )
         else:
-            query = f"query GetPlayersMatches($gv: Int!) {{ {' '.join(aliases)} }}"
-            variables = {"gv": int(game_version_id)}
+            query = f"query GetPlayersMatches({gv_decl}) {{ {' '.join(aliases)} }}"
+            variables = {"gvs": gv_ids} if multi_gv else {"gv": gv_ids[0]}
 
         data = await self.execute(
             query, variables=variables, allow_partial_data=True

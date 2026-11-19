@@ -49,7 +49,7 @@ The dataset is public and the whole pipeline is in this repo, from collecting da
 
 ```mermaid
 flowchart LR
-    A["OpenDota + STRATZ"] --> B["Collector"]
+    A["Steam + Valve Datafeed + STRATZ + OpenDota"] --> B["Collector"]
     B --> C["Parquet shards on Hugging Face"]
     C --> D["Training (PyTorch)"]
     D --> E["ONNX + vocab.json"]
@@ -60,31 +60,38 @@ flowchart LR
 
 The collector is an async Python service. It runs on its own, finds new matches, checks them, and publishes them to the dataset.
 
-**Where matches come from.** It uses four sources, in priority order:
+**Where matches come from.** It combines five complementary sources:
 
-1. **OpenDota `publicMatches`**: recent ranked games with an average rank of Immortal. It deliberately looks 1–3 hours back, because STRATZ needs time to parse a match. Fresher matches would come back empty.
+1. **Steam live ranked & league games (`GetTopLiveGame` / `GetLiveLeagueGames`)**: discovers active Immortal and tournament players directly from Valve's servers.
 2. **OpenDota `proMatches`**: league games. On first launch it also pages back to the start of the patch.
-3. **Snowball through players.** Every accepted match adds its ten players to a local queue. In batches of ten, the collector asks STRATZ for those players' recent games from the current patch. High-ranked players mostly play with each other, so the pool grows by itself.
-4. **Leaderboard fallback.** If the queue runs completely dry, it takes players from the regional leaderboards (Europe, Americas, SEA, China) and starts the snowball again.
+3. **OpenDota `publicMatches`**: recent ranked games with an average rank of Immortal, looking 1–3 hours back so STRATZ has time to parse each match.
+4. **Snowball through players.** Every accepted match adds its ten players to a local queue. In batches of ten, the collector polls STRATZ (with Steam `GetMatchHistory` as a fallback) for those players' recent games from the current patch.
+5. **Leaderboard fallback.** If the queue runs dry, it seeds players from the regional leaderboards (Europe, Americas, SEA, China) and restarts the snowball.
 
 There is no fixed MMR threshold anywhere. MMR inflates over time, so the collector relies on the Immortal bracket flag and league IDs instead.
 
-**What gets thrown out.** Full match details come from STRATZ GraphQL, batched 20 matches per request. A match is kept only if:
+**Combining Steam, STRATZ, and OpenDota.** Match details are fetched in batches of 20 from STRATZ GraphQL and enriched by Steam `GetMatchHistoryBySequenceNum` (coalescing adjacent sequence numbers):
+
+- **Steam Web API** supplies authoritative basic match and player stats (K/D/A, GPM, XPM, damage, final items) and complete `ability_upgrades` (fixing STRATZ's missing talent IDs on newer heroes like Kez/Largo and level truncation).
+- **STRATZ** supplies deep replay-parsed signals: Immortal bracket verification, player roles (1–5), lane verdicts, `@10m` gold/XP leads, damage received, and purchase timestamps.
+- **OpenDota `/matches/{id}`** supplements purchase timestamps on demand (within spare daily/minute quota) for pro and pub matches holding key items from Steam inventories that STRATZ omitted.
+
+**What gets thrown out.** A match is kept only if:
 
 - it's from the active patch, in the Immortal bracket, and either ranked (All Pick / Captains Mode) or a league Captains Mode game;
 - it lasted at least 15 minutes;
 - it's a clean 5v5 with no abandons, and every player has their own position from 1 to 5;
 - item purchases and skill upgrades are present for all ten players.
 
-Matches STRATZ hasn't finished parsing go back into the queue for a retry. Everything else is rejected with a logged reason.
+Matches STRATZ hasn't finished parsing or Steam hasn't indexed yet go back into the queue for a retry. Everything else is rejected with a logged reason.
 
-**What gets stored.** Heroes and positions, result, duration, lane results, gold and XP lead at 10:00, final stats per player, the full purchase history with timestamps, and the order of skill and talent upgrades. Player accounts and nicknames never reach the public dataset. Steam IDs live only in the collector's local SQLite and are used only for the snowball.
+**What gets stored.** Heroes and positions, result, duration, lane results, gold and XP lead at 10:00, final stats per player, the full purchase history with timestamps, and the order of skill and talent upgrades. Player accounts and nicknames never reach the public dataset. Steam IDs live only in the collector's local SQLite and are used only for discovery.
 
-Matches go out in batches as zstd-compressed Parquet files to [rizeru/d2oracle-data](https://huggingface.co/datasets/rizeru/d2oracle-data). Hero, item and ability data for the patch is merged from STRATZ and [dotaconstants](https://github.com/odota/dotaconstants) (an OpenDota project) into `vocab.json`.
+Matches go out in batches as zstd-compressed Parquet files to [rizeru/d2oracle-data](https://huggingface.co/datasets/rizeru/d2oracle-data). Hero, item, recipe, and talent metadata for the patch is built primarily from Valve's official Dota 2 Datafeed, merged with STRATZ and [dotaconstants](https://github.com/odota/dotaconstants) into `vocab.json`.
 
-**Patches.** Every hour the collector checks STRATZ for a new game version. When one comes out, it publishes whatever is left from the old patch and starts collecting the new one from scratch. Patch names are never hard-coded.
+**Patches.** Every hour the collector checks both Valve's official `patchnoteslist` and STRATZ `gameVersions`. When a new patch drops, it flushes the old patch buffer and switches to collecting the new patch immediately — even on Day 0 before third-party trackers update. Patch names are never hard-coded.
 
-API limits are tracked separately per second, minute, hour and day, with a margin below the official caps. The live values come from STRATZ response headers.
+API limits are tracked separately per second, minute, hour and day, with margins below the official caps (including Steam's 100k/day limit and live STRATZ/OpenDota headers).
 
 ### 2. The model
 
@@ -169,13 +176,13 @@ The draft is saved in the page URL, so you can share a link.
 
 ```
 d2oracle/
-├── shared/            # constants, Parquet schema, vocab.json builder
+├── shared/            # constants, Parquet schema, Valve Datafeed & vocab.json builder
 ├── collector/         # collector service
-│   ├── discovery.py       # four match sources
-│   ├── validator.py       # filters and conversion to dataset rows
-│   ├── patch_manager.py   # patch tracking and switching
-│   ├── rate_limit.py      # API limits
-│   └── clients/           # STRATZ, OpenDota, Hugging Face
+│   ├── discovery.py       # Steam live, OpenDota, STRATZ BFS, and leaderboard discovery
+│   ├── validator.py       # Steam+STRATZ merge, filters, and Parquet row conversion
+│   ├── patch_manager.py   # Valve+STRATZ patch tracking and switching
+│   ├── rate_limit.py      # multi-window API rate limiters
+│   └── clients/           # Steam, STRATZ, OpenDota, Hugging Face
 ├── training/          # model, losses, training, ONNX export
 │   ├── model.py
 │   ├── losses.py
@@ -197,7 +204,7 @@ You'll need Python 3.11+ and [uv](https://docs.astral.sh/uv/). For the site you'
 
 ```bash
 uv sync
-cp .env.example .env   # add STRATZ_TOKEN and HF_TOKEN
+cp .env.example .env   # add STRATZ_TOKEN, STEAM_API_KEY, and HF_TOKEN
 
 uv run d2oracle-collector --dry-run --no-upload   # ~20 matches, local only
 uv run d2oracle-collector                          # continuous collection
@@ -234,7 +241,8 @@ cd web && npm run typecheck && npm test
 
 ## Thanks
 
-- [STRATZ](https://stratz.com/): match data, lane results, game constants.
+- [Valve / Steam Web API](https://developer.valvesoftware.com/wiki/Steam_Web_API) and Dota 2 Datafeed: official match stats, skill/talent upgrades, and Day-0 hero/item constants.
+- [STRATZ](https://stratz.com/): parsed match analytics, roles, lane results, and `@10m` leads.
 - [OpenDota](https://www.opendota.com/): finding public and pro matches, and the [dotaconstants](https://github.com/odota/dotaconstants) project.
 - [ONNX Runtime](https://onnxruntime.ai/): running the model in the browser.
 

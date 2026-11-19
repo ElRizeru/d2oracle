@@ -10,11 +10,21 @@ import httpx
 import respx
 
 from collector.clients.opendota import OpenDotaClient
+from collector.clients.steam import SteamClient
 from collector.clients.stratz import StratzClient
 from collector.db import CollectorDB
 from collector.discovery import DiscoveryEngine
-from collector.rate_limit import build_opendota_rate_limiter, build_stratz_rate_limiter
-from shared.constants import OPENDOTA_API_URL, STRATZ_GRAPHQL_URL
+from collector.rate_limit import (
+    build_opendota_rate_limiter,
+    build_steam_rate_limiter,
+    build_stratz_rate_limiter,
+)
+from shared.constants import (
+    OPENDOTA_API_URL,
+    STEAM_ANONYMOUS_ACCOUNT_ID,
+    STEAM_API_BASE_URL,
+    STRATZ_GRAPHQL_URL,
+)
 
 
 async def test_public_seeds_filters_ranked_delay_and_patch_cutoff(tmp_path: Path) -> None:
@@ -303,4 +313,124 @@ async def test_pro_matches_backfills_historical_to_patch_start(tmp_path: Path) -
 
     all_queued = sorted(m[0] for m in db.pop_pending_matches())
     assert all_queued == [900300, 900400, 900500]
+    db.close()
+
+
+async def test_steam_live_seeds_multi_gv_bfs_and_steam_history_fallback(tmp_path: Path) -> None:
+    db = CollectorDB(tmp_path / "steam_disc.sqlite3")
+    now_ts = 1795043000
+    patch_as_of = 1795035000
+    bfs_payloads: list[dict[str, object]] = []
+
+    def stratz_bfs_handler(request: httpx.Request) -> httpx.Response:
+        bfs_payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "p0": {
+                        "matches": [
+                            {"id": 9096010, "durationSeconds": 2000, "gameMode": "ALL_PICK_RANKED", "startDateTime": now_ts - 2000, "parsedDateTime": now_ts - 100}
+                        ]
+                    }
+                }
+            },
+        )
+
+    with respx.mock:
+        respx.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetTopLiveGame/v1/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "game_list": [
+                        {
+                            "match_id": "9096050",
+                            "lobby_type": 7,
+                            "players": [
+                                {"account_id": 111001},
+                                {"account_id": STEAM_ANONYMOUS_ACCOUNT_ID},
+                            ],
+                        },
+                        {
+                            "match_id": "9096051",
+                            "lobby_type": 0,  # unranked -> ignored
+                            "players": [{"account_id": 999999}],
+                        },
+                    ]
+                },
+            )
+        )
+        respx.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetLiveLeagueGames/v1/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "games": [
+                            {
+                                "match_id": 9096052,
+                                "league_id": 20511,
+                                "players": [
+                                    {"account_id": 222002, "team": 0},
+                                    {"account_id": 333003, "team": 2},  # broadcaster -> ignored
+                                ],
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+        respx.post(STRATZ_GRAPHQL_URL).mock(side_effect=stratz_bfs_handler)
+        respx.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetMatchHistory/v1/").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "status": 1,
+                        "matches": [
+                            {"match_id": 9096011, "start_time": now_ts - 4000, "lobby_type": 7},
+                            {"match_id": 9096012, "start_time": now_ts - 600, "lobby_type": 7},  # too fresh (<3600s)
+                            {"match_id": 9096013, "start_time": now_ts - 4000, "lobby_type": 0},  # unranked
+                        ],
+                    }
+                },
+            )
+        )
+
+        async with httpx.AsyncClient() as client:
+            od = OpenDotaClient(build_opendota_rate_limiter(), http_client=client)
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            steam = SteamClient(
+                "steam_tok",
+                build_steam_rate_limiter(rps=20, rpm=600, rpd=90000),
+                http_client=client,
+            )
+            eng = DiscoveryEngine(
+                db=db,
+                stratz=stratz,
+                opendota=od,
+                steam=steam,
+                wall_clock=lambda: float(now_ts),
+            )
+
+            live_enqueued = await eng.discover_steam_live_seeds()
+            assert live_enqueued == 2
+            queued_players = sorted(
+                r[0] for r in db._conn.execute("SELECT steam_account_id FROM players_queue").fetchall()
+            )
+            assert queued_players == [111001, 222002]
+
+            bfs_enqueued = await eng.discover_bfs_from_players(
+                191, active_gv_as_of=patch_as_of, stratz_gv_ids=(190, 191)
+            )
+            assert bfs_enqueued == 1
+            assert bfs_payloads[0]["variables"] == {"gvs": [190, 191], "since": patch_as_of}
+            assert "$gvs: [Int]" in str(bfs_payloads[0]["query"])
+
+            hist_enqueued = await eng.discover_steam_player_history(
+                patch_as_of, player_ids=[111001]
+            )
+            assert hist_enqueued == 1
+
+    queued_mids = sorted(m[0] for m in db.pop_pending_matches())
+    assert queued_mids == [9096010, 9096011]
     db.close()

@@ -75,6 +75,11 @@ def test_db_players_queue_priority_and_patch_reset(tmp_path: Path) -> None:
         popped_reset = db.pop_players_for_bfs(limit=10, cooldown_seconds=1800)
         assert [p[0] for p in popped_reset] == [30, 10, 20]
         assert all(p[1] is None for p in popped_reset)
+
+        # Newly discovered active-patch players (priority >= 10) pop ahead of demoted old-patch seeds
+        db.enqueue_players([40], source="match_bfs", priority=10)
+        popped_new_patch = db.pop_players_for_bfs(limit=10, cooldown_seconds=1800)
+        assert [p[0] for p in popped_new_patch] == [40, 30, 10, 20]
     finally:
         db.close()
 

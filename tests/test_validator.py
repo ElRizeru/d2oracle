@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
-from collector.validator import validate_and_transform_match
-from shared.constants import LANE_OUTCOME_TO_ID, MISSING_STAT_SENTINEL
+from collector.validator import (
+    find_missing_key_items_from_finals,
+    prevalidate_stratz_match,
+    validate_and_transform_match,
+)
+from shared.constants import (
+    ATTRIBUTE_BONUS_ABILITY_ID,
+    LANE_OUTCOME_TO_ID,
+    MISSING_STAT_SENTINEL,
+    STEAM_ANONYMOUS_ACCOUNT_ID,
+)
 from tests.conftest import make_raw_stratz_match
 
 
@@ -341,3 +350,219 @@ def test_rejects_empty_item_purchases_or_abilities_without_playback_data(sample_
     assert res_ab.valid is False
     assert res_ab.retryable is False
     assert res_ab.reason == "empty_ability_events"
+
+
+def test_steam_merge_fixes_zero_talents_truncation_ranks_and_anon_ids(sample_vocab) -> None:
+    raw = make_raw_stratz_match(gv_id=190)
+    for p in raw["players"]:
+        p.pop("playbackData")
+        p["stats"]["itemPurchases"] = [
+            {"time": 420, "itemId": 63},
+            {"time": 1200, "itemId": 116},
+        ]
+        p["abilities"] = [
+            {"abilityId": 5003, "time": -80, "level": 0, "isTalent": False},
+            {"abilityId": 5004, "time": 110, "level": 0, "isTalent": False},
+            {"abilityId": 0, "time": 900, "level": 0, "isTalent": False},
+        ]
+
+    # Customize Radiant pos 1 (Largo=155, slot=2) with STRATZ zero talents + truncated at 18
+    rad_p1 = next(p for p in raw["players"] if p["isRadiant"] and p["position"] == "POSITION_1")
+    rad_p1["heroId"] = 155
+    rad_p1["abilities"] = [
+        {"abilityId": 1659, "time": -89, "level": 0, "isTalent": False},
+        {"abilityId": 1660, "time": 95, "level": 0, "isTalent": False},
+        {"abilityId": 0, "time": 700, "level": 0, "isTalent": False},
+        {"abilityId": ATTRIBUTE_BONUS_ABILITY_ID, "time": 800, "level": 0, "isTalent": True},
+    ]
+
+    steam_players = []
+    for p in raw["players"]:
+        slot = p["playerSlot"]
+        is_largo = p["heroId"] == 155
+        steam_players.append(
+            {
+                "account_id": STEAM_ANONYMOUS_ACCOUNT_ID if is_largo else 200000 + slot,
+                "player_slot": slot,
+                "hero_id": p["heroId"],
+                "hero_variant": 2,
+                "kills": 12 if is_largo else 4,
+                "deaths": 2,
+                "assists": 15,
+                "last_hits": 250,
+                "denies": 14,
+                "gold_per_min": 640,
+                "xp_per_min": 780,
+                "net_worth": 22000,
+                "level": 24,
+                "hero_damage": 30000,
+                "tower_damage": 5000,
+                "hero_healing": 4200,
+                "leaver_status": 0,
+                "item_0": 63,
+                "item_1": 116,
+                "item_2": 0,
+                "item_3": 0,
+                "item_4": 0,
+                "item_5": 0,
+                "item_neutral": 1720,
+                "ability_upgrades": (
+                    [
+                        {"ability": 1659, "time": 100, "level": 1},
+                        {"ability": 1660, "time": 284, "level": 2},
+                        {"ability": 8001, "time": 889, "level": 3},
+                        {"ability": ATTRIBUTE_BONUS_ABILITY_ID, "time": 989, "level": 4},
+                        {"ability": 1659, "time": 1289, "level": 5},
+                    ]
+                    if is_largo
+                    else [
+                        {"ability": 5003, "time": 109, "level": 1},
+                        {"ability": 5004, "time": 299, "level": 2},
+                        {"ability": 1495, "time": 1089, "level": 3},
+                    ]
+                ),
+            }
+        )
+    steam_match = {
+        "match_id": raw["id"],
+        "start_time": raw["startDateTime"] + 15,
+        "duration": 2222,
+        "pre_game_duration": 90,
+        "radiant_win": False,
+        "lobby_type": 7,
+        "game_mode": 22,
+        "leagueid": 0,
+        "players": steam_players,
+    }
+
+    res = validate_and_transform_match(
+        raw,
+        active_gv_id=191,
+        active_gv_name="7.42",
+        source="bfs",
+        vocab=sample_vocab,
+        steam_match=steam_match,
+        allowed_gv_ids=(190, 191),
+    )
+
+    assert res.valid is True and res.record is not None
+    rec = res.record
+    assert rec["duration_seconds"] == 2222
+    assert rec["radiant_win"] is False
+    assert rec["kills"][0] == 12
+    assert rec["gpm"][0] == 640
+    assert rec["variant"][0] == 2
+    assert STEAM_ANONYMOUS_ACCOUNT_ID not in res.player_steam_ids
+    # Largo zero-talent replaced by 8001 and tail event extrapolated (+300s after 800 -> 1100)
+    assert rec["ability_learn_ids"][0] == [1659, 1660, 8001, ATTRIBUTE_BONUS_ABILITY_ID, 1659]
+    assert rec["ability_learn_times"][0] == [-89, 95, 700, 800, 1100]
+    assert rec["ability_learn_ranks"][0] == [1, 1, 1, 1, 2]
+    assert rec["ability_learn_is_talent"][0] == [False, False, True, False, False]
+
+
+def test_opendota_purchase_log_recovers_missing_new_patch_key_item_and_prevalidation_bounds(
+    sample_vocab,
+) -> None:
+    import copy
+
+    vocab = copy.deepcopy(sample_vocab)
+    vocab["items"]["by_id"]["1953"] = {
+        "idx": vocab["items"]["vocab_size"],
+        "id": 1953,
+        "short_name": "berserkers_sabatons",
+        "display_name": "Sabatons of Mordiggian",
+        "cost": 5950,
+        "img": "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/items/berserkers_sabatons.png",
+    }
+    vocab["items"]["id_to_idx"]["1953"] = vocab["items"]["vocab_size"]
+    vocab["items"]["idx_to_id"].append(1953)
+    vocab["items"]["vocab_size"] += 1
+
+    raw = make_raw_stratz_match(
+        gv_id=190,
+        start_datetime=1795040000,
+        game_mode="CAPTAINS_MODE",
+        lobby_type="PRACTICE",
+        league_id=20511,
+    )
+    for p in raw["players"]:
+        p.pop("playbackData")
+        p["stats"]["itemPurchases"] = [{"time": 350, "itemId": 63}]
+        p["abilities"] = [{"abilityId": 5003, "time": -80, "level": 0, "isTalent": False}]
+
+    steam_players = []
+    od_players = []
+    for p in raw["players"]:
+        slot = p["playerSlot"]
+        is_carry = p["isRadiant"] and p["position"] == "POSITION_1"
+        steam_players.append(
+            {
+                "account_id": 300000 + slot,
+                "player_slot": slot,
+                "hero_id": p["heroId"],
+                "kills": 5,
+                "deaths": 1,
+                "assists": 8,
+                "last_hits": 200,
+                "denies": 10,
+                "gold_per_min": 600,
+                "xp_per_min": 700,
+                "net_worth": 20000,
+                "level": 20,
+                "hero_damage": 20000,
+                "tower_damage": 3000,
+                "hero_healing": 0,
+                "leaver_status": 0,
+                "item_0": 63,
+                "item_1": 1953 if is_carry else 0,
+                "item_2": 0,
+                "item_3": 0,
+                "item_4": 0,
+                "item_5": 0,
+                "item_neutral": 0,
+                "ability_upgrades": [{"ability": 5003, "time": 200, "level": 1}],
+            }
+        )
+        od_players.append(
+            {
+                "player_slot": slot,
+                "purchase_log": [{"time": 1480, "key": "berserkers_sabatons"}] if is_carry else [],
+            }
+        )
+    steam_match = {
+        "match_id": raw["id"],
+        "start_time": raw["startDateTime"],
+        "duration": 2100,
+        "radiant_win": True,
+        "lobby_type": 1,
+        "game_mode": 2,
+        "leagueid": 20511,
+        "players": steam_players,
+    }
+    od_match = {"match_id": raw["id"], "players": od_players}
+
+    assert find_missing_key_items_from_finals(raw, steam_match, vocab) == {1953}
+    res = validate_and_transform_match(
+        raw,
+        active_gv_id=191,
+        active_gv_name="7.42",
+        source="opendota_pro",
+        vocab=vocab,
+        steam_match=steam_match,
+        opendota_match=od_match,
+        allowed_gv_ids=(190, 191),
+        min_start_datetime=1795035000,
+    )
+    assert res.valid and res.record is not None
+    assert res.record["key_item_ids"][0] == [63, 1953]
+    assert res.record["key_item_times"][0] == [350, 1480]
+
+    # prevalidate_stratz_match enforces min/max start_datetime bounds
+    pre_before = prevalidate_stratz_match(
+        raw, active_gv_id=191, allowed_gv_ids=(190, 191), min_start_datetime=1795050000
+    )
+    assert not pre_before.valid and pre_before.reason == "before_patch_start"
+    pre_after = prevalidate_stratz_match(
+        raw, active_gv_id=190, max_start_datetime=1795035000
+    )
+    assert not pre_after.valid and pre_after.reason == "after_patch_end"

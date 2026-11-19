@@ -13,18 +13,25 @@ import pytest
 import respx
 
 from collector.clients.opendota import OpenDotaClient
+from collector.clients.steam import SteamClient
 from collector.clients.stratz import StratzClient
 from collector.config import CollectorSettings
 from collector.db import CollectorDB
 from collector.discovery import DiscoveryEngine
 from collector.main import CollectorRunner
-from collector.patch_manager import PatchManager
-from collector.rate_limit import build_opendota_rate_limiter, build_stratz_rate_limiter
+from collector.patch_manager import ActivePatchContext, PatchManager
+from collector.rate_limit import (
+    build_opendota_rate_limiter,
+    build_steam_rate_limiter,
+    build_stratz_rate_limiter,
+)
 from shared.constants import (
+    DOTA2_DATAFEED_BASE_URL,
     DOTACONSTANTS_BASE_URL,
     OPENDOTA_API_URL,
     PARQUET_ARROW_SCHEMA,
     PARQUET_SCHEMA_VERSION,
+    STEAM_API_BASE_URL,
     STRATZ_GRAPHQL_URL,
 )
 from shared.dotaconstants import DOTACONSTANTS_FILES
@@ -870,5 +877,557 @@ async def test_hf_flush_error_isolated_with_backoff_preserves_buffer(tmp_path: P
                     hf_error_streak=0,
                     error_backoff_seconds=2.0,
                 )
+
+    db.close()
+
+
+async def test_collector_e2e_with_steam_valve_datafeed_and_opendota_new_item_recovery(
+    tmp_path: Path,
+) -> None:
+    db = CollectorDB(tmp_path / "steam_e2e.sqlite3")
+    hf = InMemoryHFStorage()
+    consts_190 = make_stratz_constants_payload(gv_id=190, gv_name="7.41f", as_of=1789430400)
+    odota = make_dotaconstants_payload()
+
+    now_ts = 1795043000
+    pro_mid = 9096100
+    pub_mid = 9096101
+
+    def _make_stratz_no_pb(mid: int, seq: int, *, is_pro: bool) -> dict[str, object]:
+        m = make_raw_stratz_match(
+            match_id=mid,
+            gv_id=190,  # STRATZ lags behind Valve 7.42
+            start_datetime=now_ts - 1200,
+            game_mode="CAPTAINS_MODE" if is_pro else "ALL_PICK_RANKED",
+            lobby_type="PRACTICE" if is_pro else "RANKED",
+            league_id=20511 if is_pro else None,
+        )
+        m["sequenceNum"] = seq
+        for p in m["players"]:
+            p.pop("playbackData")
+            p["stats"]["itemPurchases"] = [{"time": 350, "itemId": 63}]
+            p["abilities"] = [
+                {"abilityId": 5003, "time": -80, "level": 0, "isTalent": False},
+                {"abilityId": 0, "time": 900, "level": 0, "isTalent": False},  # STRATZ zero bug
+            ]
+        return m
+
+    stratz_matches = {
+        pro_mid: _make_stratz_no_pb(pro_mid, 7636820010, is_pro=True),
+        pub_mid: _make_stratz_no_pb(pub_mid, 7636820020, is_pro=False),
+    }
+
+    def _make_steam_payload(mid: int, seq: int, *, is_pro: bool) -> dict[str, object]:
+        sm = stratz_matches[mid]
+        steam_players = []
+        for idx, p in enumerate(sm["players"]):  # type: ignore[arg-type]
+            is_carry = p["isRadiant"] and p["position"] == "POSITION_1"
+            steam_players.append(
+                {
+                    "account_id": 500000 + idx,
+                    "player_slot": p["playerSlot"],
+                    "hero_id": p["heroId"],
+                    "hero_variant": 0,
+                    "kills": 7,
+                    "deaths": 2,
+                    "assists": 9,
+                    "last_hits": 220,
+                    "denies": 10,
+                    "gold_per_min": 610,
+                    "xp_per_min": 740,
+                    "net_worth": 21000,
+                    "level": 22,
+                    "hero_damage": 25000,
+                    "tower_damage": 4000,
+                    "hero_healing": 0,
+                    "leaver_status": 0,
+                    "item_0": 63,
+                    "item_1": 1953 if (is_pro and is_carry) else 0,
+                    "item_2": 0,
+                    "item_3": 0,
+                    "item_4": 0,
+                    "item_5": 0,
+                    "item_neutral": 1720,
+                    "ability_upgrades": [
+                        {"ability": 5003, "time": 200, "level": 1},
+                        {"ability": 1495, "time": 1180, "level": 2},
+                    ],
+                }
+            )
+        return {
+            "match_id": mid,
+            "match_seq_num": seq,
+            "start_time": now_ts - 1200,
+            "duration": 2100,
+            "pre_game_duration": 90,
+            "radiant_win": True,
+            "lobby_type": 1 if is_pro else 7,
+            "game_mode": 2 if is_pro else 22,
+            "leagueid": 20511 if is_pro else 0,
+            "players": steam_players,
+        }
+
+    steam_payloads = [
+        _make_steam_payload(pro_mid, 7636820010, is_pro=True),
+        _make_steam_payload(pub_mid, 7636820020, is_pro=False),
+    ]
+
+    def stratz_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        q = body["query"]
+        if "GetGameVersions" in q:
+            return httpx.Response(200, json={"data": {"constants": {"gameVersions": consts_190["gameVersions"]}}})
+        if "GetConstants" in q:
+            return httpx.Response(200, json={"data": {"constants": consts_190}})
+        if "GetPlayersMatches" in q:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "p0": {
+                            "matches": [
+                                {"id": pub_mid, "durationSeconds": 2100, "gameMode": "ALL_PICK_RANKED", "startDateTime": now_ts - 1200, "parsedDateTime": now_ts - 100}
+                            ]
+                        }
+                    }
+                },
+            )
+        if "GetMatchesBatch" in q:
+            aliases = re.findall(r"(m\d+):\s*match\(id:\s*(\d+)\)", q)
+            return httpx.Response(200, json={"data": {a: stratz_matches.get(int(mid)) for a, mid in aliases}})
+        if "GetMatch" in q:
+            mid = int(body["variables"]["id"])
+            return httpx.Response(200, json={"data": {"match": stratz_matches.get(mid)}})
+        raise AssertionError(f"Unexpected STRATZ query: {q}")
+
+    def valve_handler(request: httpx.Request) -> httpx.Response:
+        ep = request.url.path.rsplit("/", 1)[-1]
+        if ep == "patchnoteslist":
+            return httpx.Response(
+                200,
+                json={
+                    "patches": [
+                        {"patch_number": "7.41f", "patch_timestamp": 1789455600},
+                        {"patch_number": "7.42", "patch_timestamp": 1794988800},
+                    ]
+                },
+            )
+        if ep == "herolist":
+            return httpx.Response(
+                200,
+                json={"result": {"data": {"heroes": [{"id": 1, "name": "npc_dota_hero_antimage", "name_loc": "Anti-Mage"}]}}},
+            )
+        if ep == "herodata":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "data": {
+                            "heroes": [
+                                {
+                                    "id": 1,
+                                    "name": "npc_dota_hero_antimage",
+                                    "name_loc": "Anti-Mage",
+                                    "primary_attr": 1,
+                                    "attack_capability": 1,
+                                    "abilities": [
+                                        {"id": 5003, "name": "antimage_mana_break", "name_loc": "Mana Break", "max_level": 4, "ability_is_innate": False, "ability_is_granted_by_scepter": False, "ability_is_granted_by_shard": False, "behavior": "2"},
+                                        {"id": 5004, "name": "antimage_blink", "name_loc": "Blink", "max_level": 4, "ability_is_innate": False, "ability_is_granted_by_scepter": False, "ability_is_granted_by_shard": False, "behavior": "16"},
+                                        {"id": 7314, "name": "antimage_counterspell", "name_loc": "Counterspell", "max_level": 4, "ability_is_innate": False, "ability_is_granted_by_scepter": False, "ability_is_granted_by_shard": False, "behavior": "4"},
+                                        {"id": 5006, "name": "antimage_mana_void", "name_loc": "Mana Void", "max_level": 3, "ability_is_innate": False, "ability_is_granted_by_scepter": False, "ability_is_granted_by_shard": False, "behavior": "8"},
+                                    ],
+                                    "talents": [{"id": 1495, "name": "special_bonus_hp_regen_3", "name_loc": "+3 Health Regen"}],
+                                }
+                            ]
+                        }
+                    }
+                },
+            )
+        if ep == "itemlist":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "data": {
+                            "itemabilities": [
+                                {"id": 63, "name": "item_power_treads", "neutral_item_tier": -1, "recipes": []},
+                                {"id": 563, "name": "item_recipe_power_treads", "neutral_item_tier": -1, "recipes": [{"items": [29, 25]}]},
+                                {"id": 1953, "name": "item_berserkers_sabatons", "neutral_item_tier": -1, "recipes": []},
+                                {"id": 1952, "name": "item_recipe_berserkers_sabatons", "neutral_item_tier": -1, "recipes": [{"items": [50, 151]}]},
+                            ]
+                        }
+                    }
+                },
+            )
+        if ep == "itemdata":
+            iid = int(request.url.params["item_id"])
+            if iid == 63:
+                return httpx.Response(200, json={"result": {"data": {"items": [{"id": 63, "name": "item_power_treads", "name_loc": "Power Treads", "item_cost": 1400, "item_quality": 2, "item_neutral_tier": 4294967295}]}}})
+            return httpx.Response(200, json={"result": {"data": {"items": [{"id": 1953, "name": "item_berserkers_sabatons", "name_loc": "Sabatons of Mordiggian", "item_cost": 5950, "item_quality": 1, "item_neutral_tier": 4294967295}]}}})
+        if ep == "abilitylist":
+            return httpx.Response(200, json={"result": {"data": {"itemabilities": []}}})
+        if ep == "patchnotes":
+            return httpx.Response(200, json={"items": [{"ability_id": 1953}]})
+        raise AssertionError(f"Unexpected Valve path: {ep}")
+
+    settings = CollectorSettings(
+        stratz_token="fake_stratz",
+        steam_api_key="fake_steam",
+        hf_token="fake_hf",
+        batch_size=5000,
+        sqlite_path=tmp_path / "steam_e2e.sqlite3",
+        parquet_dir=tmp_path / "shards",
+        constants_cache_dir=tmp_path / "constants",
+    )
+
+    with respx.mock(assert_all_called=False) as router:
+        router.post(STRATZ_GRAPHQL_URL).mock(side_effect=stratz_handler)
+        router.get(url__startswith=DOTA2_DATAFEED_BASE_URL).mock(side_effect=valve_handler)
+        for fname in DOTACONSTANTS_FILES:
+            router.get(f"{DOTACONSTANTS_BASE_URL}/{fname}").mock(
+                return_value=httpx.Response(200, json=odota[fname.removesuffix(".json")])
+            )
+        router.get(f"{OPENDOTA_API_URL}/publicMatches").mock(return_value=httpx.Response(200, json=[]))
+        router.get(f"{OPENDOTA_API_URL}/proMatches").mock(
+            return_value=httpx.Response(
+                200,
+                json=[{"match_id": pro_mid, "start_time": now_ts - 1200, "duration": 2100, "leagueid": 20511}],
+            )
+        )
+        router.get(f"{OPENDOTA_API_URL}/matches/{pro_mid}").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "match_id": pro_mid,
+                    "players": [
+                        {
+                            "player_slot": 2,
+                            "purchase_log": [{"time": 1620, "key": "berserkers_sabatons"}],
+                        }
+                    ],
+                },
+            )
+        )
+        router.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetTopLiveGame/v1/").mock(
+            return_value=httpx.Response(
+                200,
+                json={"game_list": [{"match_id": "9096999", "lobby_type": 7, "players": [{"account_id": 500001}]}]},
+            )
+        )
+        router.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetLiveLeagueGames/v1/").mock(
+            return_value=httpx.Response(200, json={"result": {"games": []}})
+        )
+        router.get(
+            f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetMatchHistoryBySequenceNum/v1/"
+        ).mock(
+            return_value=httpx.Response(200, json={"result": {"status": 1, "matches": steam_payloads}})
+        )
+
+        async with httpx.AsyncClient() as client:
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            od = OpenDotaClient(build_opendota_rate_limiter(), http_client=client)
+            steam = SteamClient(
+                "fake_steam",
+                build_steam_rate_limiter(rps=20, rpm=600, rpd=90000),
+                http_client=client,
+            )
+            pm = PatchManager(
+                target_game_version="auto",
+                db=db,
+                stratz=stratz,
+                hf_storage=hf,  # type: ignore[arg-type]
+                http_client=client,
+                constants_cache_dir=settings.constants_cache_dir,
+                parquet_dir=settings.parquet_dir,
+                wall_clock=lambda: float(now_ts),
+            )
+            discovery = DiscoveryEngine(
+                db=db,
+                stratz=stratz,
+                opendota=od,
+                steam=steam,
+                pro_min_delay_seconds=0,
+                wall_clock=lambda: float(now_ts),
+            )
+            runner = CollectorRunner(
+                settings=settings,
+                db=db,
+                stratz=stratz,
+                opendota=od,
+                hf_storage=hf,  # type: ignore[arg-type]
+                patch_manager=pm,
+                discovery=discovery,
+                steam=steam,
+            )
+            summary = await runner.run(limit=2, dry_run=True)
+
+    assert summary.gv_id == 191
+    assert summary.gv_name == "7.42"
+    assert summary.collected == 2
+    assert summary.flushed_shards == 1
+
+    latest = json.loads(hf.files["latest.json"].decode("utf-8"))
+    assert latest["game_version_name"] == "7.42"
+    shard_bytes = hf.files[latest["shards"][0]["path"]]
+    pq_path = tmp_path / "verify_742.parquet"
+    pq_path.write_bytes(shard_bytes)
+    tbl = pq.read_table(pq_path)
+    assert tbl.schema.equals(PARQUET_ARROW_SCHEMA)
+    rows = tbl.to_pylist()
+    assert len(rows) == 2
+    for row in rows:
+        for slot_aids, slot_ranks in zip(row["ability_learn_ids"], row["ability_learn_ranks"], strict=True):
+            assert 0 not in slot_aids
+            assert all(r >= 1 for r in slot_ranks)
+    pro_row = next(r for r in rows if r["match_id"] == pro_mid)
+    assert pro_row["key_item_ids"][0] == [63, 1953]
+    assert pro_row["key_item_times"][0] == [350, 1620]
+    db.close()
+
+
+async def test_opendota_missing_item_recovery_quota_tiers_for_pub_and_pro(
+    tmp_path: Path,
+) -> None:
+    db = CollectorDB(tmp_path / "quota_tiers.sqlite3")
+    hf = InMemoryHFStorage()
+    now_ts = 1795043000
+    pub_mid = 9096501
+    pro_mid = 9096502
+
+    vocab = {
+        "items": {
+            "by_id": {
+                "63": {"short_name": "power_treads"},
+                "1953": {"short_name": "berserkers_sabatons"},
+            },
+            "aliases": {},
+        }
+    }
+
+    def _raw_stratz(mid: int, *, is_pro: bool) -> dict[str, object]:
+        m = make_raw_stratz_match(
+            match_id=mid,
+            gv_id=191,
+            start_datetime=now_ts - 1200,
+            game_mode="CAPTAINS_MODE" if is_pro else "ALL_PICK_RANKED",
+            lobby_type="PRACTICE" if is_pro else "RANKED",
+            league_id=20511 if is_pro else None,
+        )
+        for p in m["players"]:  # type: ignore[attr-defined]
+            p["stats"]["itemPurchases"] = [{"time": 350, "itemId": 63}]
+        return m
+
+    def _steam_with_new_item() -> dict[str, object]:
+        return {
+            "players": [
+                {"player_slot": 0, "item_0": 63, "item_1": 1953},
+            ]
+        }
+
+    settings = CollectorSettings(
+        stratz_token="fake_stratz",
+        hf_token="fake_hf",
+        sqlite_path=tmp_path / "quota_tiers.sqlite3",
+        parquet_dir=tmp_path / "shards",
+        constants_cache_dir=tmp_path / "constants",
+    )
+
+    od_calls: list[int] = []
+    with respx.mock(assert_all_called=False) as router:
+        for mid in (pub_mid, pro_mid):
+            def _make_handler(m_id: int):
+                def _handler(request: httpx.Request) -> httpx.Response:
+                    od_calls.append(m_id)
+                    return httpx.Response(
+                        200,
+                        json={
+                            "match_id": m_id,
+                            "players": [{"player_slot": 0, "purchase_log": [{"time": 1500, "key": "berserkers_sabatons"}]}],
+                        },
+                    )
+                return _handler
+
+            router.get(f"{OPENDOTA_API_URL}/matches/{mid}").mock(side_effect=_make_handler(mid))
+
+        async with httpx.AsyncClient() as client:
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            pm = PatchManager(
+                target_game_version="auto",
+                db=db,
+                stratz=stratz,
+                hf_storage=hf,  # type: ignore[arg-type]
+                http_client=client,
+                constants_cache_dir=settings.constants_cache_dir,
+                parquet_dir=settings.parquet_dir,
+            )
+
+            # 1. Plenty of quota (>= 400/day, >= 15/min) -> pub match recovers missing new item
+            od_full = OpenDotaClient(build_opendota_rate_limiter(rpm=50, rpd=1000), http_client=client)
+            runner_full = CollectorRunner(
+                settings=settings,
+                db=db,
+                stratz=stratz,
+                opendota=od_full,
+                hf_storage=hf,  # type: ignore[arg-type]
+                patch_manager=pm,
+                discovery=DiscoveryEngine(db=db, stratz=stratz, opendota=od_full),
+            )
+            pub_res = await runner_full._maybe_fetch_opendota_for_missing_items(
+                pub_mid, _raw_stratz(pub_mid, is_pro=False), _steam_with_new_item(), vocab
+            )
+            assert pub_res is not None
+            assert od_calls == [pub_mid]
+
+            # 2. Tighter daily budget (< 400/day, >= 100/day) -> pub skips, pro still fetches
+            od_mid_rl = OpenDotaClient(build_opendota_rate_limiter(rpm=50, rpd=200), http_client=client)
+            runner_mid = CollectorRunner(
+                settings=settings,
+                db=db,
+                stratz=stratz,
+                opendota=od_mid_rl,
+                hf_storage=hf,  # type: ignore[arg-type]
+                patch_manager=pm,
+                discovery=DiscoveryEngine(db=db, stratz=stratz, opendota=od_mid_rl),
+            )
+            pub_skipped = await runner_mid._maybe_fetch_opendota_for_missing_items(
+                pub_mid, _raw_stratz(pub_mid, is_pro=False), _steam_with_new_item(), vocab
+            )
+            pro_fetched = await runner_mid._maybe_fetch_opendota_for_missing_items(
+                pro_mid, _raw_stratz(pro_mid, is_pro=True), _steam_with_new_item(), vocab
+            )
+            assert pub_skipped is None
+            assert pro_fetched is not None
+            assert od_calls == [pub_mid, pro_mid]
+
+            # 3. Exhausted budget (< 100/day) -> both pub and pro skip OpenDota cleanly
+            od_low = OpenDotaClient(build_opendota_rate_limiter(rpm=50, rpd=50), http_client=client)
+            runner_low = CollectorRunner(
+                settings=settings,
+                db=db,
+                stratz=stratz,
+                opendota=od_low,
+                hf_storage=hf,  # type: ignore[arg-type]
+                patch_manager=pm,
+                discovery=DiscoveryEngine(db=db, stratz=stratz, opendota=od_low),
+            )
+            assert (
+                await runner_low._maybe_fetch_opendota_for_missing_items(
+                    pro_mid, _raw_stratz(pro_mid, is_pro=True), _steam_with_new_item(), vocab
+                )
+                is None
+            )
+            assert od_calls == [pub_mid, pro_mid]
+
+    db.close()
+
+
+async def test_ensure_queue_has_matches_respects_discovery_intervals_when_queue_low(
+    tmp_path: Path,
+) -> None:
+    db = CollectorDB(tmp_path / "intervals.sqlite3")
+    hf = InMemoryHFStorage()
+    now_mono = [10000.0]
+    now_wall = 1795043000
+
+    # Keep 1 pending match (< PUBLIC_DISCOVERY_PENDING_THRESHOLD) + 1 fetched player so BFS sees empty
+    db.enqueue_matches([(9096701, "seed")])
+    db.enqueue_players([500001], source="seed", priority=1)
+    db.mark_player_fetched(500001, 9096701)
+
+    settings = CollectorSettings(
+        stratz_token="fake_stratz",
+        hf_token="fake_hf",
+        sqlite_path=tmp_path / "intervals.sqlite3",
+        parquet_dir=tmp_path / "shards",
+        constants_cache_dir=tmp_path / "constants",
+        pro_discovery_interval_seconds=1800,
+        public_discovery_interval_seconds=1800,
+        steam_live_discovery_interval_seconds=600,
+    )
+
+    counts = {"public": 0, "pro": 0, "steam_live": 0}
+    with respx.mock(assert_all_called=False) as router:
+        def _count_public(_req: httpx.Request) -> httpx.Response:
+            counts["public"] += 1
+            return httpx.Response(200, json=[])
+
+        def _count_pro(_req: httpx.Request) -> httpx.Response:
+            counts["pro"] += 1
+            return httpx.Response(200, json=[])
+
+        def _count_steam_live(_req: httpx.Request) -> httpx.Response:
+            counts["steam_live"] += 1
+            return httpx.Response(200, json={"game_list": []})
+
+        router.get(f"{OPENDOTA_API_URL}/publicMatches").mock(side_effect=_count_public)
+        router.get(f"{OPENDOTA_API_URL}/proMatches").mock(side_effect=_count_pro)
+        router.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetTopLiveGame/v1/").mock(
+            side_effect=_count_steam_live
+        )
+        router.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetLiveLeagueGames/v1/").mock(
+            return_value=httpx.Response(200, json={"result": {"games": []}})
+        )
+        router.post(STRATZ_GRAPHQL_URL).mock(return_value=httpx.Response(200, json={"data": {"p0": {"matches": []}}}))
+        router.get(f"{STEAM_API_BASE_URL}/IDOTA2Match_570/GetMatchHistory/v1/").mock(
+            return_value=httpx.Response(200, json={"result": {"status": 1, "matches": []}})
+        )
+
+        async with httpx.AsyncClient() as client:
+            stratz = StratzClient("tok", build_stratz_rate_limiter(), http_client=client)
+            od = OpenDotaClient(build_opendota_rate_limiter(), http_client=client)
+            steam = SteamClient("fake_steam", build_steam_rate_limiter(), http_client=client)
+            pm = PatchManager(
+                target_game_version="auto",
+                db=db,
+                stratz=stratz,
+                hf_storage=hf,  # type: ignore[arg-type]
+                http_client=client,
+                constants_cache_dir=settings.constants_cache_dir,
+                parquet_dir=settings.parquet_dir,
+            )
+            discovery = DiscoveryEngine(
+                db=db,
+                stratz=stratz,
+                opendota=od,
+                steam=steam,
+                wall_clock=lambda: float(now_wall),
+            )
+            runner = CollectorRunner(
+                settings=settings,
+                db=db,
+                stratz=stratz,
+                opendota=od,
+                hf_storage=hf,  # type: ignore[arg-type]
+                patch_manager=pm,
+                discovery=discovery,
+                steam=steam,
+                clock=lambda: now_mono[0],
+            )
+            ctx = ActivePatchContext(
+                gv_id=191,
+                gv_name="7.42",
+                as_of_datetime=1794988800,
+                vocab={},
+                min_start_datetime=1795032000,
+            )
+
+            # 1st call runs initial periodic discovery once
+            await runner._ensure_queue_has_matches(ctx)
+            assert counts == {"public": 1, "pro": 1, "steam_live": 1}
+
+            # Subsequent call 10s later with queue still below threshold must NOT spam endpoints
+            now_mono[0] = 10010.0
+            await runner._ensure_queue_has_matches(ctx)
+            assert counts == {"public": 1, "pro": 1, "steam_live": 1}
+
+            # After 605s (>= steam_live 600s, < public/pro 1800s), only Steam live refreshes
+            now_mono[0] = 10605.0
+            await runner._ensure_queue_has_matches(ctx)
+            assert counts == {"public": 1, "pro": 1, "steam_live": 2}
+
+            # After 1805s (>= 1800s), OpenDota public & pro refresh once again
+            now_mono[0] = 11805.0
+            await runner._ensure_queue_has_matches(ctx)
+            assert counts == {"public": 2, "pro": 2, "steam_live": 3}
 
     db.close()

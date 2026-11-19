@@ -8,6 +8,31 @@ STRATZ_GRAPHQL_URL = "https://api.stratz.com/graphql"
 OPENDOTA_API_URL = "https://api.opendota.com/api"
 DOTACONSTANTS_BASE_URL = "https://raw.githubusercontent.com/odota/dotaconstants/master/build"
 STEAM_CDN_BASE_URL = "https://cdn.cloudflare.steamstatic.com"
+STEAM_API_BASE_URL = "https://api.steampowered.com"
+DOTA2_DATAFEED_BASE_URL = "https://www.dota2.com/datafeed"
+
+STEAM_ANONYMOUS_ACCOUNT_ID = 4294967295
+STEAM_ALLOWED_LEAVER_STATUSES: frozenset[int] = frozenset({0, 1})
+STEAM_LOBBY_TYPE_TO_NAME: dict[int, str] = {
+    0: "UNRANKED",
+    1: "PRACTICE",
+    2: "TOURNAMENT",
+    5: "TEAM_MATCH",
+    6: "SOLO_QUEUE",
+    7: "RANKED",
+    8: "SOLO_MID",
+    9: "BATTLE_CUP",
+}
+STEAM_GAME_MODE_TO_NAME: dict[int, str] = {
+    1: "ALL_PICK",
+    2: "CAPTAINS_MODE",
+    3: "RANDOM_DRAFT",
+    4: "SINGLE_DRAFT",
+    5: "ALL_RANDOM",
+    16: "CAPTAINS_DRAFT",
+    22: "ALL_PICK_RANKED",
+    23: "TURBO",
+}
 
 POSITION_TO_INT: dict[str, int] = {
     "POSITION_1": 1,

@@ -268,6 +268,37 @@ class MultiWindowRateLimiter:
         self._cooldown_until = max(self._cooldown_until, now + wait)
         return wait
 
+    def has_spare_capacity(
+        self, *, min_day_remaining: int = 0, min_minute_remaining: int = 0
+    ) -> bool:
+        """Return True when limiter has no active cooldown and meets remaining bucket floors."""
+        now = self._clock()
+        if self._cooldown_until > now:
+            return False
+
+        u_now = self._utc_clock()
+        for bucket_name, required in (
+            ("day", min_day_remaining),
+            ("minute", min_minute_remaining),
+        ):
+            if required <= 0:
+                continue
+            bucket = self.buckets.get(bucket_name)
+            if bucket is None:
+                continue
+            bucket.prune(now, utc_now=u_now)
+            bucket.clear_stale_remote(now)
+            local_used = bucket.utc_day_count if bucket.calendar_utc_day else len(bucket.timestamps)
+            local_rem = max(0, bucket.safe_limit - local_used)
+            eff_rem = (
+                min(local_rem, bucket.remote_remaining)
+                if bucket.remote_remaining is not None
+                else local_rem
+            )
+            if eff_rem < required:
+                return False
+        return True
+
 
 def build_stratz_rate_limiter(
     *,
@@ -317,6 +348,37 @@ def build_opendota_rate_limiter(
             WindowBucket("day", 86400.0, rpd, 3000, soft_reserve=max(50, 3000 - rpd), hard_stop_reserve=25),
         ],
         clock=clock,
+        sleeper=sleeper,
+    )
+
+
+def build_steam_rate_limiter(
+    *,
+    rps: int = 5,
+    rpm: int = 240,
+    rpd: int = 90000,
+    clock: Callable[[], float] = time.monotonic,
+    utc_clock: Callable[[], float] = time.time,
+    sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> MultiWindowRateLimiter:
+    """Create a Steam Web API limiter with safe ceilings below 100k/day."""
+    return MultiWindowRateLimiter(
+        name="steam",
+        buckets=[
+            WindowBucket("second", 1.0, rps, 20, soft_reserve=max(1, 20 - rps), hard_stop_reserve=0),
+            WindowBucket("minute", 60.0, rpm, 600, soft_reserve=min(30, max(10, 600 - rpm)), hard_stop_reserve=5),
+            WindowBucket(
+                "day",
+                86400.0,
+                rpd,
+                100000,
+                soft_reserve=500,
+                hard_stop_reserve=100,
+                calendar_utc_day=True,
+            ),
+        ],
+        clock=clock,
+        utc_clock=utc_clock,
         sleeper=sleeper,
     )
 

@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from shared.constants import STEAM_ANONYMOUS_ACCOUNT_ID
+
 
 class CollectorDB:
     """Persistent SQLite WAL queue and buffer for the match collector."""
@@ -15,6 +17,8 @@ class CollectorDB:
     DISCOVERY_META_KEYS = (
         "opendota_public_cursor",
         "opendota_pro_newest_id",
+        "opendota_pro_backfill_done",
+        "opendota_pro_backfill_cursor",
         "leaderboard_cursors",
     )
 
@@ -127,21 +131,29 @@ class CollectorDB:
         raw = self.get_meta("active_patch")
         return json.loads(raw) if raw else None
 
-    def set_active_patch(self, gv_id: int, gv_name: str, as_of_datetime: int) -> None:
-        self.set_meta(
-            "active_patch",
-            json.dumps(
-                {
-                    "id": int(gv_id),
-                    "name": str(gv_name),
-                    "asOfDateTime": int(as_of_datetime),
-                }
-            ),
-        )
+    def set_active_patch(
+        self,
+        gv_id: int,
+        gv_name: str,
+        as_of_datetime: int,
+        *,
+        min_start_datetime: int | None = None,
+        valve_ahead: bool = False,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "id": int(gv_id),
+            "name": str(gv_name),
+            "asOfDateTime": int(as_of_datetime),
+        }
+        if min_start_datetime is not None:
+            payload["minStartDateTime"] = int(min_start_datetime)
+        if valve_ahead:
+            payload["valveAhead"] = True
+        self.set_meta("active_patch", json.dumps(payload))
 
     @staticmethod
     def _priority_for_source(source: str) -> int:
-        return 10 if source == "opendota_pro" else 0
+        return 10 if source in ("opendota_pro", "steam_live_league") else 0
 
     def enqueue_matches(self, matches: list[tuple[int, str]]) -> int:
         """Insert newly discovered match IDs ignoring duplicates. Returns count inserted."""
@@ -263,7 +275,11 @@ class CollectorDB:
         """Persist outcomes for a batch of validated matches in a single SQLite transaction."""
         now = int(time.time())
         clean_players = sorted(
-            {int(sid) for sid in bfs_player_ids if sid and int(sid) > 0}
+            {
+                int(sid)
+                for sid in bfs_player_ids
+                if sid and 0 < int(sid) != STEAM_ANONYMOUS_ACCOUNT_ID
+            }
         )
         retry_statuses: dict[int, str] = {}
 
@@ -345,7 +361,13 @@ class CollectorDB:
         self, steam_account_ids: list[int], source: str, priority: int = 0
     ) -> int:
         """Insert Immortal player seeds for BFS without overwriting fetch cursors."""
-        clean_ids = sorted({int(sid) for sid in steam_account_ids if sid and int(sid) > 0})
+        clean_ids = sorted(
+            {
+                int(sid)
+                for sid in steam_account_ids
+                if sid and 0 < int(sid) != STEAM_ANONYMOUS_ACCOUNT_ID
+            }
+        )
         if not clean_ids:
             return 0
         now = int(time.time())
@@ -472,7 +494,8 @@ class CollectorDB:
         with self._conn:
             self._conn.execute("DELETE FROM match_queue")
             self._conn.execute(
-                "UPDATE players_queue SET last_fetched_at = NULL, last_match_id = NULL"
+                "UPDATE players_queue SET last_fetched_at = NULL, last_match_id = NULL, "
+                "priority = MIN(priority, 1)"
             )
             placeholders = ",".join("?" for _ in self.DISCOVERY_META_KEYS)
             self._conn.execute(

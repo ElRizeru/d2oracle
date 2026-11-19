@@ -1,14 +1,18 @@
-"""Match and player discovery from non-ladder OpenDota seeds, STRATZ BFS, proMatches, and leaderboard tail."""
+"""Match and player discovery from Steam Live, OpenDota, STRATZ BFS, and leaderboard tail."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
+import httpx
+
 from collector.clients.opendota import OpenDotaClient
+from collector.clients.steam import SteamAPIError, SteamClient, SteamTransientError
 from collector.clients.stratz import StratzClient
 from collector.db import CollectorDB
 from collector.rate_limit import QuotaExhaustedError
@@ -16,6 +20,7 @@ from shared.constants import (
     LEADERBOARD_DIVISIONS,
     MIN_DURATION_SECONDS,
     RANKED_LOBBY_TYPE_ID,
+    STEAM_ANONYMOUS_ACCOUNT_ID,
     VALID_PUB_GAME_MODES,
 )
 
@@ -25,7 +30,7 @@ MIN_PUBLIC_AVG_RANK_TIER: int = 80
 
 
 class DiscoveryEngine:
-    """Coordinates all 3 Immortal & Pro match discovery sources."""
+    """Coordinates Immortal & Pro match discovery across Steam, OpenDota, and STRATZ."""
 
     def __init__(
         self,
@@ -33,6 +38,7 @@ class DiscoveryEngine:
         db: CollectorDB,
         stratz: StratzClient,
         opendota: OpenDotaClient,
+        steam: SteamClient | None = None,
         public_min_delay_seconds: int = 3600,
         public_max_delay_seconds: int = 10800,
         pro_min_delay_seconds: int = 1800,
@@ -44,6 +50,7 @@ class DiscoveryEngine:
         self.db = db
         self.stratz = stratz
         self.opendota = opendota
+        self.steam = steam
         self.public_min_delay_seconds = public_min_delay_seconds
         self.public_max_delay_seconds = public_max_delay_seconds
         self.pro_min_delay_seconds = pro_min_delay_seconds
@@ -51,6 +58,53 @@ class DiscoveryEngine:
         self.bfs_cooldown_seconds = bfs_cooldown_seconds
         self.bfs_max_age_seconds = max(0, int(bfs_max_age_seconds))
         self._wall_clock = wall_clock
+
+    async def discover_steam_live_seeds(self) -> int:
+        """Seed active high-MMR ranked and pro players from Steam live endpoints."""
+        if self.steam is None:
+            return 0
+
+        player_ids: set[int] = set()
+        try:
+            top_games = await self.steam.get_top_live_games(partner=0)
+            for game in top_games:
+                lobby = game.get("lobby_type")
+                league = int(game.get("league_id") or 0)
+                if lobby != RANKED_LOBBY_TYPE_ID and league <= 0:
+                    continue
+                for p in game.get("players") or []:
+                    if not isinstance(p, dict):
+                        continue
+                    aid = int(p.get("account_id") or 0)
+                    if 0 < aid != STEAM_ANONYMOUS_ACCOUNT_ID:
+                        player_ids.add(aid)
+        except (QuotaExhaustedError, SteamTransientError, SteamAPIError, httpx.HTTPError) as exc:
+            logger.warning("Steam GetTopLiveGame failed: %s", exc)
+
+        try:
+            league_games = await self.steam.get_live_league_games()
+            for game in league_games:
+                for p in game.get("players") or []:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("team") not in (None, 0, 1):
+                        continue
+                    aid = int(p.get("account_id") or 0)
+                    if 0 < aid != STEAM_ANONYMOUS_ACCOUNT_ID:
+                        player_ids.add(aid)
+        except (QuotaExhaustedError, SteamTransientError, SteamAPIError, httpx.HTTPError) as exc:
+            logger.warning("Steam GetLiveLeagueGames failed: %s", exc)
+
+        inserted = self.db.enqueue_players(
+            sorted(player_ids), source="steam_live", priority=15
+        )
+        if player_ids:
+            logger.info(
+                "Steam live discovery: found=%d unique_players, enqueued=%d",
+                len(player_ids),
+                inserted,
+            )
+        return inserted
 
     async def discover_public_seeds(self, active_gv_as_of: int) -> int:
         """Seed Immortal ranked matches from OpenDota publicMatches?min_rank=80 offset 1-3h back."""
@@ -148,7 +202,7 @@ class DiscoveryEngine:
         """Discover tournament pro matches >= active_gv_as_of from OpenDota proMatches."""
         raw_newest = self.db.get_meta("opendota_pro_newest_id")
         known_newest = int(raw_newest) if raw_newest else 0
-        now_ts = int(time.time())
+        now_ts = int(self._wall_clock())
 
         less_than_id: int | None = None
         newest_seen = known_newest
@@ -245,7 +299,11 @@ class DiscoveryEngine:
         return inserted
 
     async def discover_bfs_from_players(
-        self, active_gv_id: int, active_gv_as_of: int = 0
+        self,
+        active_gv_id: int,
+        active_gv_as_of: int = 0,
+        *,
+        stratz_gv_ids: Sequence[int] | None = None,
     ) -> int:
         """Run one 10-player aliased STRATZ BFS batch for the full patch duration."""
         batch = self.db.pop_players_for_bfs(
@@ -264,10 +322,16 @@ class DiscoveryEngine:
             else int(active_gv_as_of or 0)
         )
 
+        gv_arg: int | Sequence[int] = (
+            stratz_gv_ids[0]
+            if stratz_gv_ids and len(stratz_gv_ids) == 1
+            else (list(stratz_gv_ids) if stratz_gv_ids else int(active_gv_id))
+        )
+
         bfs_take = 100
         matches_by_player = await self.stratz.get_players_matches(
             player_ids,
-            active_gv_id,
+            gv_arg,
             take=bfs_take,
             start_datetime=min_start_ts if min_start_ts > 0 else None,
         )
@@ -306,6 +370,86 @@ class DiscoveryEngine:
             len(to_enqueue),
             inserted,
         )
+        return inserted
+
+    async def discover_steam_player_history(
+        self,
+        active_gv_as_of: int = 0,
+        *,
+        player_ids: list[int] | None = None,
+    ) -> int:
+        """Fallback player history discovery via Steam GetMatchHistory."""
+        if self.steam is None:
+            return 0
+
+        if player_ids is None:
+            batch = self.db.pop_players_for_bfs(
+                limit=self.bfs_batch_size,
+                cooldown_seconds=self.bfs_cooldown_seconds,
+            )
+            if not batch:
+                return 0
+            target_players = [sid for sid, _ in batch]
+            watermarks: dict[int, int | None] = dict(batch)
+            mark_fetched = True
+        else:
+            target_players = [int(sid) for sid in player_ids if sid and int(sid) > 0]
+            watermarks = {}
+            mark_fetched = False
+
+        if not target_players:
+            return 0
+
+        now_ts = int(self._wall_clock())
+        sem = asyncio.Semaphore(4)
+
+        async def _fetch_one(sid: int) -> tuple[int, list[dict[str, Any]]]:
+            async with sem:
+                matches = await self.steam.get_match_history(
+                    account_id=sid, matches_requested=25
+                )
+                return sid, matches
+
+        to_enqueue: list[tuple[int, str]] = []
+        fetched_updates: list[tuple[int, int | None]] = []
+
+        try:
+            results = await asyncio.gather(*(_fetch_one(sid) for sid in target_players))
+        except (QuotaExhaustedError, SteamTransientError, SteamAPIError, httpx.HTTPError) as exc:
+            logger.warning("Steam GetMatchHistory fallback failed: %s", exc)
+            return 0
+
+        for sid, matches in results:
+            max_id = watermarks.get(sid)
+            for m in matches:
+                raw_mid = m.get("match_id")
+                if raw_mid is None:
+                    continue
+                mid_int = int(raw_mid)
+                if max_id is None or mid_int > max_id:
+                    max_id = mid_int
+                st = int(m.get("start_time") or 0)
+                lobby = m.get("lobby_type")
+                if lobby != RANKED_LOBBY_TYPE_ID:
+                    continue
+                if active_gv_as_of > 0 and st < active_gv_as_of:
+                    continue
+                if (now_ts - st) < self.public_min_delay_seconds:
+                    continue
+                to_enqueue.append((mid_int, "steam_history"))
+            fetched_updates.append((sid, max_id))
+
+        if mark_fetched and fetched_updates:
+            self.db.mark_players_fetched_batch(fetched_updates)
+
+        inserted = self.db.enqueue_matches(to_enqueue)
+        if to_enqueue:
+            logger.info(
+                "Steam history fallback: polled=%d players, matched=%d, enqueued=%d",
+                len(target_players),
+                len(to_enqueue),
+                inserted,
+            )
         return inserted
 
     async def discover_leaderboard_tail(self) -> int:
