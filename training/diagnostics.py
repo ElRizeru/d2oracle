@@ -16,14 +16,17 @@ import onnxruntime as ort
 import torch
 import torch.nn.functional as F
 
-from shared.constants import LANE_OUTCOME_LABELS, LANE_OUTCOME_TO_ID
+from shared.constants import (
+    INVOKER_HERO_ID,
+    LANE_OUTCOME_LABELS,
+    LANE_OUTCOME_TO_ID,
+    MEEPO_HERO_ID,
+)
 from training.config import TrainingConfig
 from training.dataset import (
     BOS_ITEM_ID,
     EOS_ITEM_ID,
     IGNORE_INDEX,
-    INVOKER_HERO_ID,
-    MEEPO_HERO_ID,
     PAD_ITEM_ID,
     DotaDraftDataset,
     VocabIndex,

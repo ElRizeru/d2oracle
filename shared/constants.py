@@ -52,6 +52,49 @@ RANKED_LOBBY_TYPE_ID = 7
 LEADERBOARD_DIVISIONS: tuple[str, ...] = ("EUROPE", "AMERICAS", "SE_ASIA", "CHINA")
 
 ATTRIBUTE_BONUS_ABILITY_ID = 730
+INVOKER_HERO_ID = 74
+MEEPO_HERO_ID = 82
+
+# Dota 2 7.40+ decoupled talent unlock levels (Talent Points are independent of skill points).
+TALENT_POINT_LEVELS: tuple[int, ...] = (10, 15, 20, 25, 27, 28, 29, 30)
+
+
+def infer_talent_point_level(talent_idx: int) -> int:
+    """Infer hero level for 0-based talent choice index under decoupled 7.40+ talent points."""
+    if 0 <= talent_idx < len(TALENT_POINT_LEVELS):
+        return TALENT_POINT_LEVELS[talent_idx]
+    return 30
+
+
+def min_ult_level_for_rank(hero_id: int, rank: int) -> int:
+    """Minimum hero level required to learn the given 1-based ultimate rank."""
+    if hero_id == INVOKER_HERO_ID:
+        return 1
+    if hero_id == MEEPO_HERO_ID:
+        if rank >= 3:
+            return 17
+        if rank == 2:
+            return 10
+        return 2
+    if rank >= 3:
+        return 18
+    if rank == 2:
+        return 12
+    return 6
+
+
+def infer_skill_point_level(
+    hero_id: int,
+    skill_idx: int,
+    *,
+    is_ultimate: bool = False,
+    rank: int = 1,
+    last_skill_level: int = 0,
+) -> int:
+    """Infer hero level for 0-based non-talent skill/attribute upgrade index (1..22+ continuous)."""
+    base_lvl = skill_idx + 1
+    min_ult = min_ult_level_for_rank(hero_id, rank) if (is_ultimate and rank >= 3) else 1
+    return min(30, max(1, base_lvl, min_ult, last_skill_level))
 
 # STRATZ radiantNetworthLeads / radiantExperienceLeads prepend a pre-horn 0 at index 0,
 # so index 1 corresponds to 0:00 (networthPerMinute[0]) and index 11 is 10:00.

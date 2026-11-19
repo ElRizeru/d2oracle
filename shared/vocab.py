@@ -6,7 +6,12 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from shared.constants import ATTRIBUTE_BONUS_ABILITY_ID, STEAM_CDN_BASE_URL, VOCAB_SCHEMA_VERSION
+from shared.constants import (
+    ATTRIBUTE_BONUS_ABILITY_ID,
+    INVOKER_HERO_ID,
+    STEAM_CDN_BASE_URL,
+    VOCAB_SCHEMA_VERSION,
+)
 from shared.dotaconstants import normalize_steam_cdn_url
 
 SPECIAL_ITEM_TOKENS: dict[str, int] = {"<PAD>": 0, "<BOS>": 1, "<EOS>": 2}
@@ -213,8 +218,6 @@ EXPLICIT_ULTIMATE_ABILITY_NAMES: frozenset[str] = frozenset(
     }
 )
 
-MEEPO_HERO_ID = 82
-INVOKER_HERO_ID = 74
 INSTANT_COMPONENT_COMBINE_WINDOW_SEC = 5
 
 # Upgrade tiers collapsed onto their canonical base key item to avoid build sequence spam.

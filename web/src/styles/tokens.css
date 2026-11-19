@@ -32,12 +32,12 @@
   --dur-short: 220ms;
   --dur-long: 420ms;
 
-  --color-error: oklch(72% 0.15 27);
-  --color-success: oklch(76% 0.13 150);
+  --color-error: #f25463;
+  --color-success: #29cc52;
 
   --container: 1440px;
-  --gutter: 32px;
-  --gap-columns: 24px;
+  --gutter: 28px;
+  --gap-columns: 20px;
   --section-gap-s: 40px;
   --section-gap: 64px;
   --section-gap-l: 96px;
@@ -51,69 +51,86 @@
   --z-toast: 500;
   --z-tooltip: 600;
 
-  --color-paper: oklch(17% 0.008 250);
-  --color-paper-2: oklch(21% 0.009 250);
-  --color-paper-3: oklch(13.5% 0.007 250);
-  --color-ink: oklch(95% 0.005 250);
-  --color-ink-2: oklch(83% 0.008 250);
-  --color-muted: oklch(71% 0.01 250);
-  --color-rule: oklch(31% 0.01 250);
-  --color-rule-2: oklch(42% 0.012 250);
+  /* Obsidian canvas & white-alpha translucent surface ladder */
+  --color-paper: #0a0b0d;
+  --color-paper-2: #121418;
+  --color-paper-3: #07080a;
+  --surface-1: rgba(255, 255, 255, 0.03);
+  --surface-2: rgba(255, 255, 255, 0.055);
+  --surface-3: rgba(255, 255, 255, 0.085);
+  --surface-4: rgba(255, 255, 255, 0.13);
 
-  --color-accent: oklch(82% 0.15 80);
-  --color-accent-ink: oklch(18% 0.04 75);
-  --color-accent-soft: oklch(29% 0.05 80);
-  --color-focus: oklch(82% 0.15 80);
+  --color-ink: rgba(255, 255, 255, 0.94);
+  --color-ink-2: rgba(255, 255, 255, 0.78);
+  --color-muted: rgba(255, 255, 255, 0.56);
+  --color-dim: rgba(255, 255, 255, 0.34);
 
-  --color-cool: oklch(77% 0.12 245);
-  --color-cool-soft: oklch(29% 0.05 245);
+  --color-rule: rgba(255, 255, 255, 0.08);
+  --color-rule-2: rgba(255, 255, 255, 0.15);
 
-  --color-ok: oklch(76% 0.15 150);
-  --color-ok-soft: oklch(24.5% 0.03 150);
-  --color-bad: oklch(70% 0.17 25);
-  --color-bad-soft: oklch(24.5% 0.035 25);
+  /* Gold / Economy / Milestones / Talents */
+  --color-accent: #f2b749;
+  --color-accent-ink: #141007;
+  --color-accent-soft: rgba(242, 183, 73, 0.14);
+  --color-focus: #f2b749;
 
-  --color-attr-str: oklch(68% 0.19 25);
-  --color-attr-agi: oklch(74% 0.16 145);
-  --color-attr-int: oklch(76% 0.14 225);
-  --color-attr-all: oklch(78% 0.12 75);
+  /* Cool / XP / Utility */
+  --color-cool: #4db8ff;
+  --color-cool-soft: rgba(77, 184, 255, 0.13);
 
-  --color-skill-q: oklch(75% 0.14 235);
-  --color-skill-q-soft: oklch(26% 0.04 235);
-  --color-skill-w: oklch(75% 0.15 162);
-  --color-skill-w-soft: oklch(26% 0.04 162);
-  --color-skill-e: oklch(77% 0.15 62);
-  --color-skill-e-soft: oklch(27% 0.045 62);
-  --color-skill-r: oklch(86% 0.17 88);
-  --color-skill-r-soft: oklch(30% 0.065 88);
+  /* Radiant (Emerald) vs Dire (Crimson / Warm Orange-Red) */
+  --color-ok: #29cc52;
+  --color-ok-bright: #46e06b;
+  --color-ok-soft: rgba(41, 204, 82, 0.12);
+  --color-ok-border: rgba(41, 204, 82, 0.38);
 
-  --color-backdrop: oklch(10% 0.008 250 / 0.78);
-  --color-tooltip-bg: oklch(11% 0.008 250 / 0.96);
-  --color-selection: oklch(82% 0.15 80 / 0.25);
+  --color-bad: #ef233c;
+  --color-bad-bright: #ff5c6c;
+  --color-bad-warm: #e25d2d;
+  --color-bad-soft: rgba(239, 35, 60, 0.12);
+  --color-bad-border: rgba(239, 35, 60, 0.38);
+
+  --color-attr-str: #ef5b47;
+  --color-attr-agi: #3cd070;
+  --color-attr-int: #47b5ff;
+  --color-attr-all: #e6a947;
+
+  --color-skill-q: #4db8ff;
+  --color-skill-q-soft: rgba(77, 184, 255, 0.16);
+  --color-skill-w: #2fd48c;
+  --color-skill-w-soft: rgba(47, 212, 140, 0.16);
+  --color-skill-e: #f59e0b;
+  --color-skill-e-soft: rgba(245, 158, 11, 0.16);
+  --color-skill-r: #f2b749;
+  --color-skill-r-soft: rgba(242, 183, 73, 0.22);
+
+  --color-backdrop: rgba(5, 6, 8, 0.82);
+  --color-tooltip-bg: rgba(14, 16, 20, 0.97);
+  --color-selection: rgba(242, 183, 73, 0.24);
 
   --font-display: "Host Grotesk", ui-sans-serif, system-ui, sans-serif;
   --font-body: var(--font-display);
   --font-outlier: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
 
-  --radius-card: 10px;
+  --radius-card: 8px;
   --radius-pill: 6px;
   --radius-chip: 4px;
   --rule-hair: 1px;
-  --shadow-card: none;
-  --tracking-display: -0.03em;
-  --display-weight: 500;
-  --control-h: 36px;
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --tracking-display: -0.025em;
+  --display-weight: 600;
+  --control-h: 34px;
 }
 
 @media (max-width: 60rem) {
   :root {
-    --gutter: 24px;
+    --gutter: 20px;
   }
 }
 
 @media (max-width: 40rem) {
   :root {
-    --gutter: 16px;
-    --gap-columns: 16px;
+    --gutter: 12px;
+    --gap-columns: 12px;
   }
 }

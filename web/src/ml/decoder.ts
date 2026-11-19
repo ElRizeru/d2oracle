@@ -277,17 +277,60 @@ export function getMaxUltRankForLevel(heroId: number, level: number): number {
   return level >= 18 ? 3 : level >= 12 ? 2 : level >= 6 ? 1 : 0;
 }
 
-export function getSkippedSkillLevel(heroId: number): number | null {
+export function getSkippedSkillLevel(_heroId: number): number | null {
+  // Under Dota 2 7.40+ (including 7.41f), talents use separate Talent Points and every hero level 1..18 earns a skill point.
+  return null;
+}
+
+function hasAnyUnmaskedLogit(
+  logits: Float32Array,
+  base: number,
+  numClasses: number,
+): boolean {
+  for (let c = 0; c < numClasses; c++) {
+    if ((logits[base + c] ?? -Infinity) > MASKED_LOGIT_THRESHOLD) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isLegacyShiftedSkillStream(
+  heroId: number,
+  skillLogits: Float32Array,
+  slotOffset: number,
+  numSkillClasses: number,
+  slotTalent: number,
+  slotAttr: number,
+  levelableSlots: readonly number[],
+): boolean {
   if (heroId === 74) {
-    // Invoker receives skill points across every level 1-18.
-    return null;
+    // Invoker has no level-17 mask, so check for pre-7.40 masked T1..9 with a dominant talent spike >= Lv 10.
+    for (let li = 0; li < 9; li++) {
+      if ((skillLogits[slotOffset + li * numSkillClasses + slotTalent] ?? -Infinity) > MASKED_LOGIT_THRESHOLD) {
+        return false;
+      }
+    }
+    for (let li = 9; li < 18; li++) {
+      const base = slotOffset + li * numSkillClasses;
+      const talLogit = skillLogits[base + slotTalent] ?? -Infinity;
+      if (talLogit <= MASKED_LOGIT_THRESHOLD) continue;
+      let bestNonTalent = skillLogits[base + slotAttr] ?? -Infinity;
+      for (const s of levelableSlots) {
+        bestNonTalent = Math.max(bestNonTalent, skillLogits[base + s] ?? -Infinity);
+      }
+      if (talLogit > bestNonTalent) {
+        return true;
+      }
+    }
+    return false;
   }
-  if (heroId === 82) {
-    // Meepo earns his 17th point at level 17 and skips level 18.
-    return 18;
-  }
-  // Standard heroes earn 17 points across levels 1-16 and 18, with no point at level 17.
-  return 17;
+  const skippedIdx = heroId === 82 ? 17 : 16;
+  return !hasAnyUnmaskedLogit(
+    skillLogits,
+    slotOffset + skippedIdx * numSkillClasses,
+    numSkillClasses,
+  );
 }
 
 export function decodeSkillBuild1To18(
@@ -307,33 +350,78 @@ export function decodeSkillBuild1To18(
   const ultOrigSlots = levelableEntries
     .filter((entry) => entry.isUltimate)
     .map((entry) => entry.origSlotIdx);
-  const skippedLevel = getSkippedSkillLevel(hero.id);
+  const levelableSlotNums = levelableEntries.map((e) => e.origSlotIdx);
   const counts = new Array<number>(numSkillClasses).fill(0);
   const countsByTag: Record<string, number> = {};
   const steps: SkillLevelStep[] = [];
 
+  const legacyShifted = isLegacyShiftedSkillStream(
+    hero.id,
+    skillLogits,
+    slotOffset,
+    numSkillClasses,
+    slotTalent,
+    slotAttr,
+    levelableSlotNums,
+  );
+
+  // Build compacted non-talent logit step offsets: on pre-7.40-trained bundles, remove up to one
+  // shifted Tier 10 talent slot (idx 9..11) and one shifted Tier 15 talent slot (idx 14..17) so
+  // skills align cleanly back onto true Dota 2 hero levels 1..18 (e.g., Ult 2 at Lv 12).
+  const stepBaseOffsets: number[] = [];
+  if (legacyShifted) {
+    let skippedTier10 = false;
+    let skippedTier15 = false;
+    for (let li = 0; li < 18; li++) {
+      const base = slotOffset + li * numSkillClasses;
+      if (!hasAnyUnmaskedLogit(skillLogits, base, numSkillClasses)) {
+        continue;
+      }
+      const inT10 = li >= 9 && li <= 11 && !skippedTier10;
+      const inT15 = li >= 14 && li <= 17 && !skippedTier15;
+      if (inT10 || inT15) {
+        const talLogit = skillLogits[base + slotTalent] ?? -Infinity;
+        let bestNonTalent = skillLogits[base + slotAttr] ?? -Infinity;
+        for (const s of levelableSlotNums) {
+          const val = skillLogits[base + s] ?? -Infinity;
+          if (val > bestNonTalent) {
+            bestNonTalent = val;
+          }
+        }
+        if (talLogit > bestNonTalent) {
+          if (inT10) skippedTier10 = true;
+          else skippedTier15 = true;
+          continue;
+        }
+      }
+      stepBaseOffsets.push(base);
+    }
+  } else {
+    for (let li = 0; li < 18; li++) {
+      stepBaseOffsets.push(slotOffset + li * numSkillClasses);
+    }
+  }
+
+  let qIdx = 0;
   for (let lvlIdx = 0; lvlIdx < 18; lvlIdx++) {
     const level = lvlIdx + 1;
-    if (level === skippedLevel) {
-      steps.push({
-        level,
-        kind: "empty",
-        slotClass: -1,
-        abilityId: null,
-        label: `No skill point at level ${level}`,
-        shortTag: "—",
-        isUltimate: false,
-        img: null,
-      });
-      continue;
+    let base: number;
+    if (
+      legacyShifted &&
+      level === 18 &&
+      hero.id !== 74 &&
+      hero.id !== 82 &&
+      hasAnyUnmaskedLogit(skillLogits, slotOffset + 17 * numSkillClasses, numSkillClasses)
+    ) {
+      base = slotOffset + 17 * numSkillClasses;
+    } else if (legacyShifted) {
+      base =
+        stepBaseOffsets[qIdx] ??
+        stepBaseOffsets[stepBaseOffsets.length - 1] ??
+        slotOffset + lvlIdx * numSkillClasses;
+    } else {
+      base = stepBaseOffsets[lvlIdx] ?? slotOffset + lvlIdx * numSkillClasses;
     }
-    const base = slotOffset + lvlIdx * numSkillClasses;
-
-    const maxTalentsByLevel = level >= 15 ? 2 : level >= 10 ? 1 : 0;
-    const canTakeTalent =
-      (skillLogits[base + slotTalent] ?? -Infinity) > MASKED_LOGIT_THRESHOLD &&
-      level >= 10 &&
-      (counts[slotTalent] ?? 0) < Math.min(4, maxTalentsByLevel);
 
     const maxUltForLevel = getMaxUltRankForLevel(hero.id, level);
     const totalUltRank = ultOrigSlots.reduce((sum, idx) => sum + (counts[idx] ?? 0), 0);
@@ -367,10 +455,6 @@ export function decodeSkillBuild1To18(
       }
     }
 
-    if (canTakeTalent) {
-      legalCandidates.push(slotTalent);
-    }
-
     const canTakeAttr =
       (skillLogits[base + slotAttr] ?? -Infinity) > MASKED_LOGIT_THRESHOLD &&
       (counts[slotAttr] ?? 0) < 7 &&
@@ -379,7 +463,7 @@ export function decodeSkillBuild1To18(
       legalCandidates.push(slotAttr);
     }
 
-    // Fallback: relax Dota 2 rank caps across encoder-unmasked levelable classes so build never stalls.
+    // Fallback: relax rank caps only across encoder-unmasked non-talent skills so every level stays valid.
     let pool = legalCandidates;
     if (pool.length === 0) {
       pool = [];
@@ -388,9 +472,6 @@ export function decodeSkillBuild1To18(
         if ((skillLogits[base + s] ?? -Infinity) > MASKED_LOGIT_THRESHOLD) {
           pool.push(s);
         }
-      }
-      if (level >= 10 && (counts[slotTalent] ?? 0) < 4) {
-        pool.push(slotTalent);
       }
       if ((skillLogits[base + slotAttr] ?? -Infinity) > MASKED_LOGIT_THRESHOLD) {
         pool.push(slotAttr);
@@ -412,19 +493,11 @@ export function decodeSkillBuild1To18(
     }
 
     counts[chosen] = (counts[chosen] ?? 0) + 1;
+    if (qIdx < stepBaseOffsets.length) {
+      qIdx += 1;
+    }
 
-    if (chosen === slotTalent) {
-      steps.push({
-        level,
-        kind: "talent",
-        slotClass: chosen,
-        abilityId: null,
-        label: "Talent",
-        shortTag: "T",
-        isUltimate: false,
-        img: null,
-      });
-    } else if (chosen === slotAttr) {
+    if (chosen === slotAttr) {
       steps.push({
         level,
         kind: "attribute",

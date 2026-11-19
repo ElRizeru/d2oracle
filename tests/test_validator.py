@@ -312,15 +312,31 @@ def test_validates_abilities_and_item_purchases_without_playback_data(sample_voc
     assert rec["key_item_ids"][0] == [63, 1, 116, 104]
     assert rec["key_item_times"][0] == [420, 780, 1200, 1500]
 
-    # Standard hero: 1..16, 18, 20, 25..30, bounded at 30 without IndexError, tie at index 1..2 preserved
-    assert rec["ability_learn_levels"][0] == [*range(1, 17), 18, 20, 25, 26, 27, 28, 29, 30, 30, 30]
+    # Under 7.40+ rules, talents use decoupled points (10, 15, 20, 25) and skills advance 1..22 continuously,
+    # keeping same-second tie order intact across indices 1..2.
+    assert rec["ability_learn_levels"][0] == [
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 10, 11, 12, 13,
+        15, 14, 15, 20, 25,
+        16, 17, 18, 19, 20, 21, 22,
+    ]
     assert rec["ability_learn_ids"][0][1:3] == [5006, 7314]
 
-    # Invoker (74): contiguous 1..25 (includes 17..24)
-    assert rec["ability_learn_levels"][1] == list(range(1, 26))
+    # Invoker (74): 21 non-talent orbs across 1..21 + 4 separate talents at 10, 15, 20, 25
+    assert rec["ability_learn_levels"][1] == [
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 10, 11, 12, 13,
+        15, 14, 15, 16, 17, 20,
+        18, 19, 20, 21, 25,
+    ]
 
-    # Meepo (82): includes 17, skips 18, jumps to 20, 25..28
-    assert rec["ability_learn_levels"][2] == [*range(1, 18), 20, 25, 26, 27, 28]
+    # Meepo (82): 18 non-talent skills across 1..18 + 4 separate talents at 10, 15, 20, 25
+    assert rec["ability_learn_levels"][2] == [
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+        10, 10, 11, 12, 13,
+        15, 14, 15, 20, 25,
+        16, 17, 18,
+    ]
 
 
 def test_rejects_empty_item_purchases_or_abilities_without_playback_data(sample_vocab) -> None:

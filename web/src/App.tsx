@@ -222,7 +222,15 @@ export function App() {
         <div className="container mast__inner">
           <div className="mast__brand">
             <a href="./" className="wordmark" aria-label="d2oracle home">
-              d2oracle
+              <img
+                src="./logo.png"
+                alt=""
+                width={28}
+                height={28}
+                className="wordmark__logo"
+                aria-hidden="true"
+              />
+              <span>d2oracle</span>
             </a>
           </div>
 
@@ -236,6 +244,7 @@ export function App() {
               aria-expanded={modelInfoOpen}
               title={bundle === null ? "Loading patch bundle" : "View active model details"}
             >
+              <span className="status-chip__dot" aria-hidden="true" />
               <Cpu size={14} aria-hidden="true" />
               <span>Patch</span>
               <span className="measured">{patchName}</span>
@@ -286,7 +295,7 @@ export function App() {
       <footer className="site-footer">
         <div className="container site-footer__inner">
           <p className="muted-note">
-            Hero, ability, and item metadata from STRATZ and dotaconstants.
+            Hero, ability, and item metadata from Valve Datafeed and dotaconstants.
           </p>
           <div className="site-footer__links">
             <a

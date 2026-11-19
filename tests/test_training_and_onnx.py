@@ -202,14 +202,11 @@ def test_vocab_index_masks_and_duplicate_talent_names(sample_vocab: dict[str, An
     assert mask.shape == (vidx.num_heroes + 1, 18, vidx.num_skill_classes)
 
     am_idx = vidx.hero_id_to_idx[1]
-    assert torch.all(mask[am_idx, :9, :3])
+    assert torch.all(mask[am_idx, :, :3])
     assert not torch.any(mask[am_idx, :, 3])
-    assert not torch.any(mask[am_idx, :9, vidx.slot_talent])
-    assert not torch.any(mask[am_idx, 16, :])  # Standard heroes gain no point at level 17 (idx 16)
-    active_talent_lvls = [i for i in range(9, 18) if i != 16]
-    active_all_lvls = [i for i in range(18) if i != 16]
-    assert torch.all(mask[am_idx, active_talent_lvls, vidx.slot_talent])
-    assert torch.all(mask[am_idx, active_all_lvls, vidx.slot_attr])
+    # Talents are decoded via talent_targets rather than consuming 1..18 skill slots
+    assert not torch.any(mask[am_idx, :, vidx.slot_talent])
+    assert torch.all(mask[am_idx, :, vidx.slot_attr])
 
     choices = {vidx.hero_talent_id_to_choice[1][tid] for tid in (6800, 999901, 665)}
     assert choices == {(1, 0), (1, 1)}
@@ -339,9 +336,9 @@ def test_dataset_encoding_and_stage2_target_masks(
     assert pytest.approx(sample["econ_kda_targets"][0, 2].item(), rel=1e-4) == 310.0 / 35.0
     assert pytest.approx(sample["econ_kda_targets"][0, 3].item(), rel=1e-4) == 8.0 / 3.5
 
-    # Skills & talents (aid=0 at 10<=lvl<=18 on active levels maps to slot_talent; lvl 17 skipped)
-    assert sample["skill_targets"][0, 9].item() == vidx.slot_talent
-    assert sample["skill_targets"][0, 15].item() == vidx.slot_talent
+    # Skills & talents: decoupled talents populate talent_targets without overwriting skill_targets; lvl 17 is valid.
+    assert sample["skill_targets"][0, 9].item() == IGNORE_INDEX
+    assert sample["skill_targets"][0, 15].item() == IGNORE_INDEX
     assert sample["skill_targets"][0, 16].item() == IGNORE_INDEX
     assert sample["skill_targets"][0, 17].item() == vidx.slot_attr
     assert sample["talent_targets"][0].tolist() == [0, 0, 0, 0]
@@ -712,8 +709,9 @@ def test_attribute_bonus_with_is_talent_maps_to_slot_attr_and_aid_zero_handling(
     row["ability_learn_times"][0] = [60, 420, 720, 900, 1140, 1200]
     row["ability_learn_ranks"][0] = [1, 1, 1, 1, 1, 1]
     # aid=730 even with is_talent=True encodes as slot_attr;
-    # aid=0 at lvl<10 stays IGNORE_INDEX; unmapped positive aid stays IGNORE_INDEX;
-    # lvl=17 is skipped on standard heroes -> IGNORE_INDEX; aid=0 at lvl=18 maps to slot_talent.
+    # aid=0 stays out of skill_targets; unmapped positive aid stays IGNORE_INDEX;
+    # lvl=17 is now an active skill point level on standard heroes; talents remain decoupled.
+    row["ability_learn_ids"][0] = [5003, 0, 999999, ATTRIBUTE_BONUS_ABILITY_ID, ATTRIBUTE_BONUS_ABILITY_ID, 0]
     row["ability_learn_is_talent"][0] = [False, False, False, True, False, False]
 
     sample = DotaDraftDataset([row], vidx)[0]
@@ -721,8 +719,32 @@ def test_attribute_bonus_with_is_talent_maps_to_slot_attr_and_aid_zero_handling(
     assert sample["skill_targets"][0, 7].item() == IGNORE_INDEX
     assert sample["skill_targets"][0, 11].item() == IGNORE_INDEX
     assert sample["skill_targets"][0, 13].item() == vidx.slot_attr
-    assert sample["skill_targets"][0, 16].item() == IGNORE_INDEX
-    assert sample["skill_targets"][0, 17].item() == vidx.slot_talent
+    assert sample["skill_targets"][0, 16].item() == vidx.slot_attr
+    assert sample["skill_targets"][0, 17].item() == IGNORE_INDEX
+
+    # Verify contiguous pre-7.40 shifted shard timelines automatically unshift onto 7.40+ levels:
+    # 1..9 abilities, 10=skill, 11=talent, 12=skill, 13=Ult(rank2), 14..15=skills, 16=talent, 18=Ult(rank3)
+    vocab_with_ult = copy.deepcopy(sample_vocab)
+    vocab_with_ult["abilities"]["by_id"]["5006"]["is_ultimate"] = True
+    vidx_ult = VocabIndex(vocab_with_ult)
+    shifted = _make_training_row(match_id=9002, start_datetime=1794600100)
+    shifted["ability_learn_ids"][0] = [
+        5003, 5004, 5003, 5004, 5003, 5006, 5003, 5004, 5004, 7314,
+        1495,
+        7314, 5006, 7314, 7314,
+        6800,
+        5006,
+    ]
+    shifted["ability_learn_levels"][0] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18]
+    shifted["ability_learn_times"][0] = list(range(60, 17 * 60 + 1, 60))
+    shifted["ability_learn_ranks"][0] = [1] * 17
+    shifted["ability_learn_is_talent"][0] = [i in (10, 15) for i in range(17)]
+    unshifted_sample = DotaDraftDataset([shifted], vidx_ult)[0]
+    assert unshifted_sample["skill_targets"][0, 9].item() == 2   # Lv 10 = 10th skill (7314)
+    assert unshifted_sample["skill_targets"][0, 10].item() == 2  # Lv 11 = 11th skill (7314)
+    assert unshifted_sample["skill_targets"][0, 11].item() == 3  # Lv 12 = Ult rank 2 (5006)!
+    assert unshifted_sample["skill_targets"][0, 17].item() == 3  # Lv 18 = Ult rank 3 (5006)!
+    assert unshifted_sample["talent_targets"][0, :2].tolist() == [0, 0]
 
 
 def test_meepo_level2_ult_encodes_and_trains_with_finite_skill_loss(
@@ -1111,8 +1133,9 @@ def test_infer_zero_talent_tiers_and_recovery_without_val_leakage(
     s0 = ds[0]
     # T10 -> 1 (from aid=0, protected against lvl 27 leftover 9101), T15 -> IGNORE (both missing), T20 -> 1, T25 -> 1
     assert s0["talent_targets"][0].tolist() == [1, IGNORE_INDEX, 1, 1]
-    assert s0["skill_targets"][0, 9].item() == vidx.slot_talent
-    assert s0["skill_targets"][0, 14].item() == vidx.slot_talent
+    assert s0["skill_targets"][0, 0].item() == 0
+    assert s0["skill_targets"][0, 9].item() == IGNORE_INDEX
+    assert s0["skill_targets"][0, 14].item() == IGNORE_INDEX
 
     s1 = ds[1]
     # Ambiguous lvl 15 consumes slot 0 (stays IGNORE), lvl 16 resolves [1] (both missing -> IGNORE), lvl 20 resolves T20=1
@@ -2040,6 +2063,15 @@ def test_v4_ordinal_lane5_targets_and_skill_rank_penalty(
         r["top_lane_outcome"] = outcomes[i]
         r["mid_lane_outcome"] = outcomes[(i + 1) % 5]
         r["bottom_lane_outcome"] = outcomes[(i + 2) % 5]
+        # Give all 10 heroes 10 skill upgrades across levels 1..10 so cumulative slot-0 spam violates the rank-4 cap strongly.
+        r["ability_learn_ids"] = [
+            ([5003, 5004, 5003, 5004, 5003, 5006, 5003, 5004, 5004, 7314] if hid == 1 else [1659, 1660, 1659, 1660, 1659, 1662, 1659, 1660, 1660, 1661])
+            for hid in r["hero_ids"]
+        ]
+        r["ability_learn_levels"] = [list(range(1, 11)) for _ in r["hero_ids"]]
+        r["ability_learn_times"] = [list(range(60, 10 * 60 + 1, 60)) for _ in r["hero_ids"]]
+        r["ability_learn_ranks"] = [[1] * 10 for _ in r["hero_ids"]]
+        r["ability_learn_is_talent"] = [[False] * 10 for _ in r["hero_ids"]]
         rows.append(r)
 
     ds = DotaDraftDataset(rows, vidx, max_item_len=8)

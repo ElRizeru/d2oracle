@@ -19,36 +19,55 @@ from shared.constants import (
     STEAM_LOBBY_TYPE_TO_NAME,
     STRATZ_LEADS_10M_INDEX,
     VALID_PUB_GAME_MODES,
+    infer_skill_point_level,
+    infer_talent_point_level,
 )
 from shared.vocab import ITEM_ALIAS_TARGETS, extract_key_item_purchases
 
 ALLOWED_LEAVER_STATUSES: frozenset[str] = frozenset({"NONE", "DISCONNECTED"})
 MAX_PLAYBACK_RETRY_AGE_SECONDS: int = 6 * 3600
 
-# Dota 2 ability/talent point grant levels:
-# - Invoker (74): receives an ability/talent/stat point on every level 1..30.
-# - Meepo (82): skips level 18 (points at 1..17, 20, 25, 26..30).
-# - All other heroes: skip levels 17, 19, 21..24 (points at 1..16, 18, 20, 25, 26..30).
-_INVOKER_HERO_ID: int = 74
-_MEEPO_HERO_ID: int = 82
-_INVOKER_POINT_LEVELS: tuple[int, ...] = tuple(range(1, 31))
-_MEEPO_POINT_LEVELS: tuple[int, ...] = (*range(1, 18), 20, 25, 26, 27, 28, 29, 30)
-_STANDARD_POINT_LEVELS: tuple[int, ...] = (*range(1, 17), 18, 20, 25, 26, 27, 28, 29, 30)
 
+def _resolve_upgrade_rank_and_level(
+    *,
+    hero_id: int,
+    aid: int,
+    canon_aid: int,
+    is_tal: bool,
+    raw_lvl: Any,
+    ab_by_id: dict[str, Any],
+    rank_counts: dict[int, int],
+    skill_idx: int,
+    talent_idx: int,
+    last_skill_lvl: int,
+) -> tuple[int, int, int, int, int]:
+    """Compute 1-based rank, 7.40+ hero level, and updated skill/talent cursors."""
+    if is_tal:
+        rank = 1
+        lvl = int(raw_lvl) if raw_lvl is not None else infer_talent_point_level(talent_idx)
+        return rank, lvl, skill_idx, talent_idx + 1, last_skill_lvl
 
-def _infer_point_level(hero_id: int, point_idx: int) -> int:
-    """Infer hero levelObtained for 0-based ability upgrade index."""
-    if hero_id == _INVOKER_HERO_ID:
-        table = _INVOKER_POINT_LEVELS
-    elif hero_id == _MEEPO_HERO_ID:
-        table = _MEEPO_POINT_LEVELS
+    if aid == ATTRIBUTE_BONUS_ABILITY_ID:
+        rank = 1
+        is_ult = False
     else:
-        table = _STANDARD_POINT_LEVELS
-    if 0 <= point_idx < len(table):
-        return table[point_idx]
-    if not table:
-        return min(30, max(1, point_idx + 1))
-    return min(30, table[-1] + (point_idx - len(table) + 1))
+        rank = rank_counts.get(canon_aid, 0) + 1
+        rank_counts[canon_aid] = rank
+        ab_meta = ab_by_id.get(str(canon_aid)) or ab_by_id.get(str(aid)) or {}
+        is_ult = bool(ab_meta.get("is_ultimate")) and not bool(ab_meta.get("is_innate"))
+
+    lvl = (
+        int(raw_lvl)
+        if raw_lvl is not None
+        else infer_skill_point_level(
+            hero_id,
+            skill_idx,
+            is_ultimate=is_ult,
+            rank=rank,
+            last_skill_level=last_skill_lvl,
+        )
+    )
+    return rank, lvl, skill_idx + 1, talent_idx, lvl
 
 
 def _extract_player_timelines(
@@ -237,6 +256,7 @@ def _align_steam_ability_upgrades(
 ) -> tuple[list[int], list[int], list[int], list[int], list[bool]]:
     """Convert Steam ability_upgrades into aligned horn-relative timelines with 1-based ranks."""
     abilities_sec = vocab.get("abilities") or {}
+    ab_by_id = abilities_sec.get("by_id") or {}
     talent_id_set = {int(x) for x in (abilities_sec.get("talent_ids") or [])}
     ab_by_id = abilities_sec.get("by_id") or {}
     ab_aliases = {int(k): int(v) for k, v in (abilities_sec.get("aliases") or {}).items()}
@@ -267,6 +287,9 @@ def _align_steam_ability_upgrades(
     last_stratz_t: int | None = None
     last_steam_t: int | None = None
     rank_counts: dict[int, int] = {}
+    skill_idx = 0
+    talent_idx = 0
+    last_skill_lvl = 0
 
     a_ids: list[int] = []
     a_times: list[int] = []
@@ -274,7 +297,7 @@ def _align_steam_ability_upgrades(
     a_ranks: list[int] = []
     a_talents: list[bool] = []
 
-    for idx, sev in enumerate(steam_sorted):
+    for sev in steam_sorted:
         aid = int(sev["ability"])
         steam_t = int(sev.get("time") or 0)
         canon_aid = ab_aliases.get(aid, aid)
@@ -301,12 +324,18 @@ def _align_steam_ability_upgrades(
         else:
             t = steam_t - int(pre_game_duration)
 
-        lvl = _infer_point_level(hero_id, idx)
-        if is_tal or aid == ATTRIBUTE_BONUS_ABILITY_ID:
-            rank = 1
-        else:
-            rank = rank_counts.get(canon_aid, 0) + 1
-            rank_counts[canon_aid] = rank
+        rank, lvl, skill_idx, talent_idx, last_skill_lvl = _resolve_upgrade_rank_and_level(
+            hero_id=hero_id,
+            aid=aid,
+            canon_aid=canon_aid,
+            is_tal=is_tal,
+            raw_lvl=None,
+            ab_by_id=ab_by_id,
+            rank_counts=rank_counts,
+            skill_idx=skill_idx,
+            talent_idx=talent_idx,
+            last_skill_lvl=last_skill_lvl,
+        )
 
         a_ids.append(aid)
         a_times.append(_clamp(t, -3600, 32000))
@@ -548,6 +577,7 @@ def validate_and_transform_match(
 
     bfs_player_ids_set: set[int] = set()
     abilities_sec = vocab.get("abilities") or {}
+    ab_by_id = abilities_sec.get("by_id") or {}
     talent_id_set = {int(x) for x in (abilities_sec.get("talent_ids") or [])}
     ab_aliases = {int(k): int(v) for k, v in (abilities_sec.get("aliases") or {}).items()}
     pre_game_dur = int(steam_match.get("pre_game_duration") or 90) if steam_match else 90
@@ -682,7 +712,10 @@ def validate_and_transform_match(
             a_ranks = []
             a_talents = []
             rank_counts: dict[int, int] = {}
-            for ab_idx, ev in enumerate(raw_abilities):
+            skill_idx = 0
+            talent_idx = 0
+            last_skill_lvl = 0
+            for ev in raw_abilities:
                 if ev.get("abilityId") is None:
                     continue
                 aid = int(ev["abilityId"])
@@ -691,16 +724,20 @@ def validate_and_transform_match(
                     bool(ev.get("isTalent")) or aid in talent_id_set
                 )
                 raw_lvl = ev.get("levelObtained")
-                inferred_lvl = (
-                    int(raw_lvl)
-                    if raw_lvl is not None
-                    else _infer_point_level(hero_id_int, len(a_ids) if infer_levels else ab_idx)
+                rank, inferred_lvl, skill_idx, talent_idx, last_skill_lvl = (
+                    _resolve_upgrade_rank_and_level(
+                        hero_id=hero_id_int,
+                        aid=aid,
+                        canon_aid=canon_aid,
+                        is_tal=is_tal,
+                        raw_lvl=raw_lvl,
+                        ab_by_id=ab_by_id,
+                        rank_counts=rank_counts,
+                        skill_idx=skill_idx,
+                        talent_idx=talent_idx,
+                        last_skill_lvl=last_skill_lvl,
+                    )
                 )
-                if is_tal or aid == ATTRIBUTE_BONUS_ABILITY_ID:
-                    rank = 1
-                else:
-                    rank = rank_counts.get(canon_aid, 0) + 1
-                    rank_counts[canon_aid] = rank
                 a_ids.append(aid)
                 a_times.append(_clamp(ev.get("time"), -3600, 32000))
                 a_levels.append(_clamp(inferred_lvl, 0, 30))

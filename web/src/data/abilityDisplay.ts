@@ -1,4 +1,4 @@
-import type { AbilityMeta, HeroMeta } from "../types/oracle";
+import type { AbilityMeta, HeroMeta, SkillLevelStep } from "../types/oracle";
 
 const BASIC_SKILL_LABELS = ["Q", "W", "E", "D", "F", "G"] as const;
 
@@ -421,4 +421,44 @@ export function getLevelableSkillEntries(
       colorKey,
     };
   });
+}
+
+export function getMaxAbilityRanks(
+  heroId: number,
+  entry: LevelableSkillEntry,
+  pickedCount: number,
+): number {
+  const baseCap =
+    heroId === INVOKER_HERO_ID && entry.origSlotIdx < 3
+      ? 7
+      : entry.isUltimate
+        ? 3
+        : 4;
+  return Math.max(baseCap, pickedCount);
+}
+
+/**
+ * Collect the hero levels (1..18) where a given levelable skill entry was upgraded,
+ * matching by original slot index or canonical hotkey tag for paired abilities.
+ */
+export function getAbilityPickedLevels(
+  entry: LevelableSkillEntry,
+  entries: readonly LevelableSkillEntry[],
+  skills: readonly SkillLevelStep[],
+): number[] {
+  const knownSlots = new Set(entries.map((e) => e.origSlotIdx));
+  const levels: number[] = [];
+
+  for (const step of skills) {
+    if (step.kind !== "ability") continue;
+    if (knownSlots.has(step.slotClass)) {
+      if (step.slotClass === entry.origSlotIdx) {
+        levels.push(step.level);
+      }
+    } else if (step.shortTag === entry.shortTag) {
+      levels.push(step.level);
+    }
+  }
+
+  return levels;
 }

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Check,
+  ChevronDown,
+  ChevronUp,
   GripVertical,
   Link2,
   Loader2,
@@ -12,6 +14,7 @@ import {
 
 import { ROLE_NAMES } from "../data/draftPresets";
 import type { DraftSlot, HeroMeta } from "../types/oracle";
+import { AttributeIcon, FactionEmblem, RoleIcon } from "./DotaIcons";
 import { HeroPortraitImg } from "./HeroPortraitImg";
 
 export { ROLE_NAMES };
@@ -51,7 +54,14 @@ export function DraftWorkspace({
   const [dragSourceSlotIdx, setDragSourceSlotIdx] = useState<number | null>(null);
   const [dragOverSlotIdx, setDragOverSlotIdx] = useState<number | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
   const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (filledCount < 10 && collapsed) {
+      setCollapsed(false);
+    }
+  }, [filledCount, collapsed]);
 
   useEffect(() => {
     return () => {
@@ -163,6 +173,9 @@ export function DraftWorkspace({
           {canDrag ? (
             <GripVertical size={13} className="draft-slot__grip" aria-hidden="true" />
           ) : null}
+          <span className="draft-slot__role-icon" aria-hidden="true">
+            <RoleIcon position={slot.position} size={14} />
+          </span>
           <span className="draft-slot__role">
             <span className="role-label--full">{role.full}</span>
             <span className="role-label--short" aria-hidden="true">
@@ -205,6 +218,9 @@ export function DraftWorkspace({
               <span className="draft-slot__hero-info">
                 <span className="draft-slot__hero-name">{hero.display_name}</span>
               </span>
+              <span className="draft-slot__attr">
+                <AttributeIcon attr={hero.primary_attr} size={15} />
+              </span>
             </>
           ) : (
             <>
@@ -234,16 +250,98 @@ export function DraftWorkspace({
     );
   };
 
+  const renderCollapsedStrip = () => (
+    <div className="draft-mini-bar">
+      <div className="draft-mini-team draft-mini-team--radiant">
+        <span className="draft-mini-team__label">
+          <FactionEmblem side="radiant" size={16} />
+          <span>Radiant</span>
+        </span>
+        <div className="draft-mini-team__portraits">
+          {radiantSlots.map((slot) => {
+            const hero = slot.heroId !== null ? heroesById[String(slot.heroId)] : undefined;
+            return (
+              <button
+                key={slot.slotIdx}
+                type="button"
+                className="draft-mini-chip draft-mini-chip--radiant"
+                onClick={() => onOpenPicker(slot.slotIdx)}
+                title={hero ? `${hero.display_name} (${ROLE_NAMES[slot.position].full})` : "Pick hero"}
+                aria-label={hero ? `Change Radiant ${ROLE_NAMES[slot.position].full}: ${hero.display_name}` : "Pick hero"}
+              >
+                <span className="draft-mini-chip__thumb">
+                  <HeroPortraitImg
+                    src={hero?.img}
+                    alt={hero?.display_name ?? ""}
+                    fallbackText={hero?.display_name.slice(0, 2) ?? "?"}
+                    width={68}
+                    height={32}
+                    decorative
+                  />
+                </span>
+                <span className="draft-mini-chip__role">
+                  <RoleIcon position={slot.position} size={12} />
+                  <span className="draft-mini-chip__role-label">{ROLE_NAMES[slot.position].short}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <span className="draft-mini-bar__vs" aria-hidden="true">
+        vs
+      </span>
+
+      <div className="draft-mini-team draft-mini-team--dire">
+        <div className="draft-mini-team__portraits">
+          {direSlots.map((slot) => {
+            const hero = slot.heroId !== null ? heroesById[String(slot.heroId)] : undefined;
+            return (
+              <button
+                key={slot.slotIdx}
+                type="button"
+                className="draft-mini-chip draft-mini-chip--dire"
+                onClick={() => onOpenPicker(slot.slotIdx)}
+                title={hero ? `${hero.display_name} (${ROLE_NAMES[slot.position].full})` : "Pick hero"}
+                aria-label={hero ? `Change Dire ${ROLE_NAMES[slot.position].full}: ${hero.display_name}` : "Pick hero"}
+              >
+                <span className="draft-mini-chip__thumb">
+                  <HeroPortraitImg
+                    src={hero?.img}
+                    alt={hero?.display_name ?? ""}
+                    fallbackText={hero?.display_name.slice(0, 2) ?? "?"}
+                    width={68}
+                    height={32}
+                    decorative
+                  />
+                </span>
+                <span className="draft-mini-chip__role">
+                  <RoleIcon position={slot.position} size={12} />
+                  <span className="draft-mini-chip__role-label">{ROLE_NAMES[slot.position].short}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <span className="draft-mini-team__label">
+          <span>Dire</span>
+          <FactionEmblem side="dire" size={16} />
+        </span>
+      </div>
+    </div>
+  );
+
   return (
     <section className="draft-panel" aria-labelledby="draft-heading">
       <div className="draft-toolbar">
         <div className="draft-toolbar__title-group">
-          <h1 id="draft-heading">Draft</h1>
-          <p className="draft-toolbar__sub">
-            Pick or drag 10 unique heroes across roles.
-            <span className="measured draft-toolbar__count">
-              {" "}
-              {filledCount}/10 picked
+          <div className="draft-toolbar__heading-row">
+            <h1 id="draft-heading">Draft</h1>
+            <span
+              className={`draft-count-pill measured ${filledCount === 10 ? "is-complete" : ""}`}
+            >
+              {filledCount}/10
             </span>
             {predicting ? (
               <span className="draft-predicting" role="status" aria-live="polite">
@@ -251,7 +349,12 @@ export function DraftWorkspace({
                 <span>Updating…</span>
               </span>
             ) : null}
-          </p>
+          </div>
+          {!collapsed ? (
+            <p className="draft-toolbar__sub">
+              Pick or drag 10 unique heroes across roles.
+            </p>
+          ) : null}
         </div>
 
         <div className="draft-toolbar__controls">
@@ -261,7 +364,7 @@ export function DraftWorkspace({
             disabled={!bundleReady || predicting}
             onClick={onRandomDraft}
           >
-            <Shuffle size={15} aria-hidden="true" />
+            <Shuffle size={14} aria-hidden="true" />
             <span>Random draft</span>
           </button>
 
@@ -272,9 +375,9 @@ export function DraftWorkspace({
             onClick={() => void handleCopyDraftLink()}
           >
             {copiedLink ? (
-              <Check size={15} aria-hidden="true" />
+              <Check size={14} aria-hidden="true" />
             ) : (
-              <Link2 size={15} aria-hidden="true" />
+              <Link2 size={14} aria-hidden="true" />
             )}
             <span>{copiedLink ? "Copied!" : "Copy draft link"}</span>
           </button>
@@ -285,33 +388,64 @@ export function DraftWorkspace({
             disabled={!bundleReady || filledCount === 0 || predicting}
             onClick={onClearAll}
           >
-            <RotateCcw size={15} aria-hidden="true" />
+            <RotateCcw size={14} aria-hidden="true" />
             <span>Reset</span>
           </button>
+
+          {filledCount === 10 ? (
+            <button
+              type="button"
+              className="btn btn--quiet draft-collapse-btn"
+              aria-expanded={!collapsed}
+              onClick={() => setCollapsed((prev) => !prev)}
+            >
+              {collapsed ? (
+                <>
+                  <ChevronDown size={14} aria-hidden="true" />
+                  <span>Expand</span>
+                </>
+              ) : (
+                <>
+                  <ChevronUp size={14} aria-hidden="true" />
+                  <span>Compact</span>
+                </>
+              )}
+            </button>
+          ) : null}
         </div>
       </div>
 
-      <div className="teams-grid">
-        <div className="team-column" aria-label="Radiant roster">
-          <div className="team-column__head team-column__head--radiant">
-            <h2 className="team-column__title">Radiant</h2>
-            <span className="measured team-column__tag">
-              {radiantSlots.filter((s) => s.heroId !== null).length}/5
-            </span>
+      {collapsed && filledCount === 10 ? (
+        renderCollapsedStrip()
+      ) : (
+        <div className="teams-grid">
+          <div className="team-column" aria-label="Radiant roster">
+            <div className="team-column__head team-column__head--radiant">
+              <div className="team-column__brand">
+                <FactionEmblem side="radiant" size={18} />
+                <h2 className="team-column__title">Radiant</h2>
+              </div>
+              <span className="measured team-column__tag">
+                {radiantSlots.filter((s) => s.heroId !== null).length}/5
+              </span>
+            </div>
+            <div className="team-column__rows">{radiantSlots.map(renderSlotRow)}</div>
           </div>
-          <div className="team-column__rows">{radiantSlots.map(renderSlotRow)}</div>
-        </div>
 
-        <div className="team-column" aria-label="Dire roster">
-          <div className="team-column__head team-column__head--dire">
-            <h2 className="team-column__title">Dire</h2>
-            <span className="measured team-column__tag">
-              {direSlots.filter((s) => s.heroId !== null).length}/5
-            </span>
+          <div className="team-column" aria-label="Dire roster">
+            <div className="team-column__head team-column__head--dire">
+              <div className="team-column__brand">
+                <FactionEmblem side="dire" size={18} />
+                <h2 className="team-column__title">Dire</h2>
+              </div>
+              <span className="measured team-column__tag">
+                {direSlots.filter((s) => s.heroId !== null).length}/5
+              </span>
+            </div>
+            <div className="team-column__rows">{direSlots.map(renderSlotRow)}</div>
           </div>
-          <div className="team-column__rows">{direSlots.map(renderSlotRow)}</div>
         </div>
-      </div>
+      )}
     </section>
   );
 }

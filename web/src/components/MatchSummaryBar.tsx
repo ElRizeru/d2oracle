@@ -1,3 +1,5 @@
+import { Clock } from "lucide-react";
+
 import { ROLE_NAMES } from "../data/draftPresets";
 import { formatLead10m, formatWinOddsPair } from "../ml/decoder";
 import type {
@@ -6,6 +8,7 @@ import type {
   LaneKey,
   MatchPaceOption,
 } from "../types/oracle";
+import { FactionEmblem, GoldCoinIcon, LaneDirectionIcon } from "./DotaIcons";
 import { HeroPortraitImg } from "./HeroPortraitImg";
 
 interface MatchSummaryBarProps {
@@ -45,16 +48,15 @@ function toDurationPct(minutes: number): number {
 function getWinEdgeLabel(radLeadDiff: number): string {
   const absDiff = Math.abs(radLeadDiff);
   if (absDiff <= 1) {
-    return "Even matchup";
+    return "Even";
   }
-  const leader = radLeadDiff > 0 ? "Radiant" : "Dire";
   if (absDiff < 8) {
-    return `Slight ${leader} edge`;
+    return "Slight edge";
   }
   if (absDiff < 20) {
-    return `${leader} favored`;
+    return "Favored";
   }
-  return `Strong ${leader} edge`;
+  return "Strong edge";
 }
 
 function getLaneHeroes(
@@ -126,14 +128,9 @@ export function MatchSummaryBar({
   const radLeadDiff = Number(radPctText) - Number(direPctText);
   const radiantLeads = radLeadDiff > 1;
   const direLeads = radLeadDiff < -1;
+  const bannerTone = radiantLeads ? "radiant" : direLeads ? "dire" : "even";
 
-  const favoredBadgeText = getWinEdgeLabel(radLeadDiff);
-
-  const favoredBadgeClass = radiantLeads
-    ? "summary-badge--radiant"
-    : direLeads
-      ? "summary-badge--dire"
-      : "";
+  const edgeText = getWinEdgeLabel(radLeadDiff);
 
   const midMin = Math.max(10, Math.round(prediction.durationP50));
   const loMin = Math.max(10, Math.min(midMin, Math.round(prediction.durationP25)));
@@ -149,139 +146,152 @@ export function MatchSummaryBar({
 
   return (
     <section
-      className={`summary-strip ${predicting ? "is-updating" : ""}`}
+      className={`match-banner match-banner--${bannerTone} ${predicting ? "is-updating" : ""}`}
       aria-labelledby="forecast-summary-heading"
     >
       <h2 id="forecast-summary-heading" className="visually-hidden">
         Match summary
       </h2>
 
-      <div className="summary-cell summary-cell--win">
-        <div className="summary-cell__top">
-          <span>Win probability</span>
-          <span className={`summary-badge ${favoredBadgeClass} nowrap`}>
-            {favoredBadgeText}
-          </span>
-        </div>
-
-        <div className="win-readout">
-          <div className="win-side win-side--radiant">
-            <span className="win-side__name">Radiant</span>
-            <span className="reading num">{radPctText}%</span>
+      <div className="match-banner__hero">
+        <div className="banner-team banner-team--radiant">
+          <div className="banner-team__crest banner-team__crest--radiant">
+            <FactionEmblem side="radiant" size={28} />
           </div>
-          <div className="win-side win-side--dire">
-            <span className="win-side__name">Dire</span>
-            <span className="reading num">{direPctText}%</span>
-          </div>
-        </div>
-
-        <div
-          className="win-bar-wrap"
-          role="img"
-          aria-label={`Radiant ${radPctText} percent versus Dire ${direPctText} percent`}
-        >
-          <div className="win-bar">
-            <span
-              className="win-bar__fill win-bar__fill--radiant"
-              style={{ transform: `scaleX(${radProb})` }}
-            />
-            <span
-              className="win-bar__fill win-bar__fill--dire"
-              style={{ transform: `scaleX(${direProb})` }}
-            />
-            <span className="win-bar__mid" aria-hidden="true" />
-          </div>
-          <div className="win-bar__tick-row" aria-hidden="true">
-            <span className="win-bar__tick-label measured">50%</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="summary-cell summary-cell--duration">
-        <div className="summary-cell__top">
-          <span>Expected match time</span>
-          {matchPace !== 0 ? (
-            <span className="summary-badge summary-badge--pace measured nowrap">
-              Builds @ {matchPace}m
-            </span>
-          ) : null}
-        </div>
-
-        <div className="duration-headline">
-          <div className="duration-readout">
-            <span className="reading num">~{midMin}</span>
-            <span className="duration-unit nowrap">min</span>
-          </div>
-          <div className="duration-window measured nowrap">
-            <span>
-              {loMin}–{hiMin} min window
-            </span>
+          <div className="banner-team__info">
+            <div className="banner-team__title-row">
+              <span className="banner-team__name">Radiant</span>
+              {radiantLeads ? (
+                <span className="banner-pill banner-pill--radiant nowrap">{edgeText}</span>
+              ) : !direLeads ? (
+                <span className="banner-pill banner-pill--even nowrap">Even</span>
+              ) : null}
+            </div>
+            <div className="banner-team__odds reading num">{radPctText}%</div>
           </div>
         </div>
 
-        <div
-          className="duration-scale"
-          role="img"
-          aria-label={`Expected match time around ${midMin} minutes, typical window ${loMin} to ${hiMin} minutes`}
-        >
-          <div className="duration-scale__track">
-            {SCALE_TICKS.slice(1, -1).map((tick) => (
-              <span
-                key={tick}
-                className="duration-scale__grid-tick"
-                style={{ left: `${toDurationPct(tick)}%` }}
-                aria-hidden="true"
-              />
-            ))}
-            <span
-              className="duration-scale__iqr"
-              style={{ left: `${p25Left}%`, width: `${windowWidth}%` }}
-            />
-            <span
-              className="duration-scale__median"
-              style={{ left: `${p50Left}%` }}
-            />
-          </div>
-          <div className="duration-scale__labels measured" aria-hidden="true">
-            {SCALE_TICKS.map((tick, idx) => (
-              <span
-                key={tick}
-                className={`duration-scale__tick-label ${idx === 0 ? "is-start" : idx === SCALE_TICKS.length - 1 ? "is-end" : ""}`}
-                style={{ left: `${toDurationPct(tick)}%` }}
-              >
-                {tick}m
+        <div className="banner-center">
+          <div className="banner-clock-box">
+            <div className="banner-clock-box__top">
+              <span className="banner-clock-box__label">
+                <Clock size={12} aria-hidden="true" />
+                <span>Expected duration</span>
               </span>
-            ))}
+              {matchPace !== 0 ? (
+                <span className="banner-pill banner-pill--pace measured nowrap">
+                  Builds @ {matchPace}m
+                </span>
+              ) : null}
+            </div>
+
+            <div className="banner-clock-box__readout">
+              <span className="banner-clock-box__mid reading num">~{midMin}m</span>
+              <span className="banner-clock-box__window measured nowrap">
+                {loMin}–{hiMin} min window
+              </span>
+            </div>
+
+            <div
+              className="duration-scale"
+              role="img"
+              aria-label={`Expected match time around ${midMin} minutes, typical window ${loMin} to ${hiMin} minutes`}
+            >
+              <div className="duration-scale__track">
+                {SCALE_TICKS.slice(1, -1).map((tick) => (
+                  <span
+                    key={tick}
+                    className="duration-scale__grid-tick"
+                    style={{ left: `${toDurationPct(tick)}%` }}
+                    aria-hidden="true"
+                  />
+                ))}
+                <span
+                  className="duration-scale__iqr"
+                  style={{ left: `${p25Left}%`, width: `${windowWidth}%` }}
+                />
+                <span
+                  className="duration-scale__median"
+                  style={{ left: `${p50Left}%` }}
+                />
+              </div>
+              <div className="duration-scale__labels measured" aria-hidden="true">
+                {SCALE_TICKS.map((tick, idx) => (
+                  <span
+                    key={tick}
+                    className={`duration-scale__tick-label ${idx === 0 ? "is-start" : idx === SCALE_TICKS.length - 1 ? "is-end" : ""}`}
+                    style={{ left: `${toDurationPct(tick)}%` }}
+                  >
+                    {tick}m
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="banner-pace-row">
+            <span className="banner-pace-row__label">Match pace</span>
+            <div className="segmented match-pace-segmented" role="group" aria-label="Match pace">
+              {PACE_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  className={`segmented__btn ${matchPace === opt.value ? "is-active" : ""}`}
+                  aria-pressed={matchPace === opt.value}
+                  onClick={() => onSelectMatchPace(opt.value)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
-        <div className="match-pace-row">
-          <span className="match-pace-row__label">Match pace</span>
-          <div className="segmented match-pace-segmented" role="group" aria-label="Match pace">
-            {PACE_OPTIONS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                className={`segmented__btn ${matchPace === opt.value ? "is-active" : ""}`}
-                aria-pressed={matchPace === opt.value}
-                onClick={() => onSelectMatchPace(opt.value)}
-              >
-                {opt.label}
-              </button>
-            ))}
+        <div className="banner-team banner-team--dire">
+          <div className="banner-team__info banner-team__info--dire">
+            <div className="banner-team__title-row">
+              {direLeads ? (
+                <span className="banner-pill banner-pill--dire nowrap">{edgeText}</span>
+              ) : !radiantLeads ? (
+                <span className="banner-pill banner-pill--even nowrap">Even</span>
+              ) : null}
+              <span className="banner-team__name">Dire</span>
+            </div>
+            <div className="banner-team__odds reading num">{direPctText}%</div>
+          </div>
+          <div className="banner-team__crest banner-team__crest--dire">
+            <FactionEmblem side="dire" size={28} />
           </div>
         </div>
       </div>
 
-      <div className="summary-cell summary-cell--laning">
-        <div className="summary-cell__top summary-cell__top--laning">
-          <span>Laning (0–10 min)</span>
+      <div
+        className="banner-winbar"
+        role="img"
+        aria-label={`Radiant ${radPctText} percent versus Dire ${direPctText} percent`}
+      >
+        <span
+          className="banner-winbar__fill banner-winbar__fill--radiant"
+          style={{ transform: `scaleX(${radProb})` }}
+        />
+        <span
+          className="banner-winbar__fill banner-winbar__fill--dire"
+          style={{ transform: `scaleX(${direProb})` }}
+        />
+        <span className="banner-winbar__mid" aria-hidden="true" />
+      </div>
+
+      <div className="banner-laning">
+        <div className="banner-laning__meta">
+          <span className="banner-laning__title">Laning (0–10 min)</span>
           <div className="lead10m-group" aria-label="Estimated 10-minute team advantage">
             <span className={`lead10m-pill lead10m-pill--${goldLead.side} measured nowrap`}>
+              <GoldCoinIcon size={13} />
               <span className="lead10m-pill__k">Gold @10m</span>
               <strong>{goldLead.label}</strong>
             </span>
             <span className={`lead10m-pill lead10m-pill--${xpLead.side} measured nowrap`}>
+              <span className="lead10m-dot lead10m-dot--xp" aria-hidden="true" />
               <span className="lead10m-pill__k">XP @10m</span>
               <strong>{xpLead.label}</strong>
             </span>
@@ -296,9 +306,14 @@ export function MatchSummaryBar({
             const matchupTitle = `${radHeroes.map((h) => `${h.hero.display_name} (${ROLE_NAMES[h.position].short})`).join(" + ")} vs ${direHeroes.map((h) => `${h.hero.display_name} (${ROLE_NAMES[h.position].short})`).join(" + ")}`;
 
             return (
-              <div key={lane.lane} className="lane-card">
+              <div key={lane.lane} className={`lane-card lane-card--${lane.verdictSide}`}>
                 <div className="lane-card__head">
-                  <span className="lane-card__title">{lane.label}</span>
+                  <span className="lane-card__title-wrap">
+                    <span className={`lane-card__dir lane-card__dir--${lane.verdictSide}`}>
+                      <LaneDirectionIcon lane={lane.lane} size={14} />
+                    </span>
+                    <span className="lane-card__title">{lane.label}</span>
+                  </span>
                   <span
                     className={`lane-card__verdict lane-card__verdict--${lane.verdictSide} nowrap`}
                   >
@@ -315,8 +330,8 @@ export function MatchSummaryBar({
                             src={hp.hero.img}
                             alt={hp.hero.display_name}
                             fallbackText={hp.hero.display_name.slice(0, 2)}
-                            width={28}
-                            height={16}
+                            width={30}
+                            height={17}
                           />
                         </span>
                       ))}
@@ -331,8 +346,8 @@ export function MatchSummaryBar({
                             src={hp.hero.img}
                             alt={hp.hero.display_name}
                             fallbackText={hp.hero.display_name.slice(0, 2)}
-                            width={28}
-                            height={16}
+                            width={30}
+                            height={17}
                           />
                         </span>
                       ))}

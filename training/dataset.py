@@ -19,14 +19,16 @@ from torch.utils.data import Dataset
 
 from shared.constants import (
     ATTRIBUTE_BONUS_ABILITY_ID,
+    INVOKER_HERO_ID,
     LANE_OUTCOME_5_TO_ID,
     LANE_OUTCOME_TO_ID,
+    MEEPO_HERO_ID,
     MISSING_STAT_SENTINEL,
     PARQUET_ARROW_SCHEMA,
     PARQUET_SCHEMA_VERSION,
     VOCAB_SCHEMA_VERSION,
+    infer_skill_point_level,
 )
-from shared.vocab import INVOKER_HERO_ID, MEEPO_HERO_ID
 from training.config import (
     HEAL_SHARE_MIN_TEAM_SUM,
     MIN_MATCH_DURATION_MIN,
@@ -185,7 +187,6 @@ class VocabIndex:
         self._hero_num_skills_by_idx: dict[int, int] = {}
 
         from shared.vocab import (
-            INVOKER_HERO_ID,
             LINKED_ABILITY_NAME_ALIASES,
             MISSING_LINKED_ABILITY_ID_FALLBACKS,
             NON_LEVELABLE_ABILITY_NAMES,
@@ -292,14 +293,9 @@ class VocabIndex:
             for ult_slot in self.hero_ult_slots.get(hidx, ()):
                 mask[hidx, :min_ult_idx, ult_slot] = False
 
-            mask[hidx, 9:, self.slot_talent] = True  # Talents unlock at level 10 (0-based idx >= 9)
+            # Under Dota 2 7.40+, talents use dedicated Talent Points (predicted via talent_targets)
+            # and every hero level 1..18 earns a skill/attribute point (no level 17 or 18 skip).
             mask[hidx, :, self.slot_attr] = True
-
-            # Zero out levels where a hero gains no skill point (lvl 17 standard, lvl 18 Meepo)
-            if hid == MEEPO_HERO_ID:
-                mask[hidx, 17, :] = False
-            elif hid != INVOKER_HERO_ID:
-                mask[hidx, 16, :] = False
         return mask
 
     def map_item_id(self, raw_item_id: int) -> int | None:
@@ -574,7 +570,6 @@ def _encode_match_row_into_arrays(
     skill_map_lookup = v.hero_skill_id_to_slot
     talent_map_lookup = v.hero_talent_id_to_choice
     slot_attr = v.slot_attr
-    slot_talent = v.slot_talent
 
     hero_ids_row = row["hero_ids"]
     is_rad_row = row["is_radiant"]
@@ -625,9 +620,18 @@ def _encode_match_row_into_arrays(
         talent_map = talent_map_lookup.get(hid)
         hero_zero_tiers = zero_tier_lookup.get(hid)
         hero_skill_mask = skill_mask_py[h_idx]
+        ult_slots = v.hero_ult_slots.get(h_idx, ())
         occupied_tiers = [False, False, False, False]
         talent_vals = [IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]
         skill_vals = [IGNORE_INDEX] * 18
+
+        is_contiguous_timeline = (
+            len(ab_lvls_row[p_i]) >= 11
+            and all(int(ab_lvls_row[p_i][k]) == k + 1 for k in range(10))
+        )
+        skill_idx = 0
+        last_skill_lvl = 0
+        slot_rank_counts: dict[int, int] = {}
 
         for aid_raw, lvl_raw, is_tal in zip(
             ab_ids_row[p_i],
@@ -639,6 +643,8 @@ def _encode_match_row_into_arrays(
             lvl = int(lvl_raw)
 
             skill_target_slot: int | None = None
+            is_ult_upgrade = False
+            skill_rank = 1
             if aid == ATTRIBUTE_BONUS_ABILITY_ID:
                 skill_target_slot = slot_attr
             elif talent_map is not None and aid in talent_map:
@@ -646,39 +652,49 @@ def _encode_match_row_into_arrays(
                 if not occupied_tiers[tier_idx] and talent_vals[tier_idx] == IGNORE_INDEX:
                     talent_vals[tier_idx] = choice_idx
                 occupied_tiers[tier_idx] = True
-                if lvl >= 10:
-                    skill_target_slot = slot_talent
             elif aid == 0:
-                if lvl >= 10:
-                    skill_target_slot = slot_talent
-                    if hero_zero_tiers:
-                        candidates = [
-                            ti
-                            for ti in range(4)
-                            if ti in hero_zero_tiers
-                            and not occupied_tiers[ti]
-                            and lvl >= 10 + 5 * ti
-                        ]
-                        if len(candidates) == 1:
-                            ti = candidates[0]
-                            occupied_tiers[ti] = True
-                            known_c = hero_zero_tiers[ti]
-                            if known_c is not None and talent_vals[ti] == IGNORE_INDEX:
-                                talent_vals[ti] = 1 - int(known_c)
-                        elif len(candidates) > 1:
-                            occupied_tiers[candidates[0]] = True
+                if lvl >= 10 and hero_zero_tiers:
+                    candidates = [
+                        ti
+                        for ti in range(4)
+                        if ti in hero_zero_tiers
+                        and not occupied_tiers[ti]
+                        and lvl >= 10 + 5 * ti
+                    ]
+                    if len(candidates) == 1:
+                        ti = candidates[0]
+                        occupied_tiers[ti] = True
+                        known_c = hero_zero_tiers[ti]
+                        if known_c is not None and talent_vals[ti] == IGNORE_INDEX:
+                            talent_vals[ti] = 1 - int(known_c)
+                    elif len(candidates) > 1:
+                        occupied_tiers[candidates[0]] = True
             elif aid > 0 and is_tal:
-                if lvl >= 10:
-                    skill_target_slot = slot_talent
+                pass
             elif skill_map is not None and aid in skill_map:
                 skill_target_slot = skill_map[aid]
+                skill_rank = slot_rank_counts.get(skill_target_slot, 0) + 1
+                slot_rank_counts[skill_target_slot] = skill_rank
+                is_ult_upgrade = skill_target_slot in ult_slots
 
-            if (
-                skill_target_slot is not None
-                and 1 <= lvl <= 18
-                and hero_skill_mask[lvl - 1][skill_target_slot]
-            ):
-                skill_vals[lvl - 1] = skill_target_slot
+            if skill_target_slot is not None:
+                if is_contiguous_timeline:
+                    target_lvl = infer_skill_point_level(
+                        hid,
+                        skill_idx,
+                        is_ultimate=is_ult_upgrade,
+                        rank=skill_rank,
+                        last_skill_level=last_skill_lvl,
+                    )
+                    last_skill_lvl = target_lvl
+                    skill_idx += 1
+                else:
+                    target_lvl = lvl
+                if (
+                    1 <= target_lvl <= 18
+                    and hero_skill_mask[target_lvl - 1][skill_target_slot]
+                ):
+                    skill_vals[target_lvl - 1] = skill_target_slot
 
         talent_targets[idx, p_i] = talent_vals
         skill_targets[idx, p_i] = skill_vals

@@ -8,9 +8,16 @@ import { describe, expect, it } from "vitest";
 import {
   NON_LEVELABLE_ABILITY_NAMES,
   getAbilityColorKey,
+  getAbilityPickedLevels,
   getLevelableSkillEntries,
+  getMaxAbilityRanks,
   isLevelableAbility,
 } from "../src/data/abilityDisplay";
+import {
+  formatTimingShort,
+  isBootItemShortName,
+  splitBootsAndCoreItems,
+} from "../src/data/itemDisplay";
 import {
   assignHeroToSlot,
   createEmptyDraft,
@@ -257,34 +264,44 @@ describe("decodeSkillBuild1To18 & decodeTalentChoices", () => {
 
     const steps = decodeSkillBuild1To18(hero, logits, 0, numClasses, slotTalent, slotAttr, makeAbilitiesMap());
     expect(steps).toHaveLength(18);
-    expect(getSkippedSkillLevel(hero.id)).toBe(17);
-    // Standard hero skips level 17 cleanly without fabricating +2 Attributes.
+    expect(getSkippedSkillLevel(hero.id)).toBeNull();
+    // Under 7.40+ rules, all 18 hero levels receive a skill/attribute point (talents use separate Talent Points).
+    expect(steps.every((s) => s.kind !== "empty")).toBe(true);
     expect(steps[16]!.level).toBe(17);
-    expect(steps[16]!.kind).toBe("empty");
-    expect(steps[16]!.abilityId).toBeNull();
-    expect(steps[16]!.shortTag).toBe("—");
+    expect(steps[16]!.kind).toBe("attribute");
     // First ult must occur exactly at level 6, second at level 12, third at level 18.
     expect(steps.filter((s) => s.slotClass === 3).map((s) => s.level)).toEqual([6, 12, 18]);
-    // First talent occurs at level 10, second at level 15 (none before 10).
-    expect(steps.filter((s) => s.kind === "talent").map((s) => s.level)).toEqual([10, 15]);
+    // Talents remain decoupled from the 1..18 skill-point track.
+    expect(steps.some((s) => s.kind === "talent")).toBe(false);
     // Level 1 cannot take Q rank 2 at level 2 because ceil(2/2) = 1.
     expect(steps[0]!.shortTag).toBe("Q");
     expect(steps[1]!.shortTag).toBe("W");
 
-    // Even if slotAttr has a huge logit at level 17 on a standard hero, level 17 stays empty.
-    const highAttrLogits = new Float32Array(logits);
-    highAttrLogits[16 * numClasses + slotAttr] = 500.0;
-    const stepsHighAttr = decodeSkillBuild1To18(
-      hero,
-      highAttrLogits,
-      0,
-      numClasses,
-      slotTalent,
-      slotAttr,
-      makeAbilitiesMap(),
-    );
-    expect(stepsHighAttr[16]!.kind).toBe("empty");
-    expect(stepsHighAttr[16]!.abilityId).toBeNull();
+    // Legacy shifted pre-7.40 ONNX stream (11=Talent, 13=Ult2, 16=Talent, 17=-10000, 18=Ult3)
+    // must unshift cleanly onto true hero levels (10=skill, 12=Ult2, 15=+2, 17=+2, 18=Ult3).
+    const shiftedLogits = new Float32Array(18 * numClasses).fill(-4);
+    for (let li = 0; li < 18; li++) {
+      if (li === 16) {
+        shiftedLogits.fill(-10000, li * numClasses, (li + 1) * numClasses);
+        continue;
+      }
+      shiftedLogits[li * numClasses + slotAttr] = 0.2;
+      if (li === 5 || li === 12 || li === 17) {
+        shiftedLogits[li * numClasses + 3] = 8.0; // Ult at raw steps 6, 13, 18
+      } else if (li === 10 || li === 15) {
+        shiftedLogits[li * numClasses + slotTalent] = 8.0; // Shifted Tier 10 & Tier 15 talents
+      } else {
+        shiftedLogits[li * numClasses + (li % 3)] = 5.0;
+        shiftedLogits[li * numClasses + ((li + 1) % 3)] = 3.0;
+        shiftedLogits[li * numClasses + ((li + 2) % 3)] = 1.0;
+      }
+    }
+    const unshifted = decodeSkillBuild1To18(hero, shiftedLogits, 0, numClasses, slotTalent, slotAttr, makeAbilitiesMap());
+    expect(unshifted).toHaveLength(18);
+    expect(unshifted.every((s) => s.kind !== "empty" && s.kind !== "talent")).toBe(true);
+    expect(unshifted.filter((s) => s.slotClass === 3).map((s) => s.level)).toEqual([6, 12, 18]);
+    expect(unshifted[9]!.kind).toBe("ability");
+    expect(unshifted[16]!.kind).toBe("attribute");
   });
 
   it("allows Attribute Bonus from level 6 when encoder logits prefer early stats, capped at 7", () => {
@@ -306,7 +323,7 @@ describe("decodeSkillBuild1To18 & decodeTalentChoices", () => {
 
     const steps = decodeSkillBuild1To18(hero, logits, 0, numClasses, slotTalent, slotAttr, makeAbilitiesMap());
     const attrLevels = steps.filter((s) => s.kind === "attribute").map((s) => s.level);
-    expect(attrLevels.every((lvl) => lvl >= 6 && lvl !== 17)).toBe(true);
+    expect(attrLevels.every((lvl) => lvl >= 6)).toBe(true);
     expect(attrLevels).toHaveLength(7);
     expect(attrLevels.some((lvl) => lvl < 15)).toBe(true);
   });
@@ -512,8 +529,8 @@ describe("decodeSkillBuild1To18 & decodeTalentChoices", () => {
     const willowSteps = decodeSkillBuild1To18(willow, willowLogits, 0, numClasses, 14, 15, byId);
     expect(willowSteps.filter((s) => s.isUltimate).map((s) => s.level)).toEqual([6, 12, 18]);
 
-    // Meepo (id=82): Divided We Stand unlocks at levels 2, 10, 17 in 7.41f and level 18 is skipped.
-    expect(getSkippedSkillLevel(82)).toBe(18);
+    // Meepo (id=82): Divided We Stand unlocks at levels 2, 10, 17 in 7.41f and continues cleanly at level 18.
+    expect(getSkippedSkillLevel(82)).toBeNull();
     expect(getMaxUltRankForLevel(82, 1)).toBe(0);
     expect(getMaxUltRankForLevel(82, 2)).toBe(1);
     expect(getMaxUltRankForLevel(82, 10)).toBe(2);
@@ -531,7 +548,7 @@ describe("decodeSkillBuild1To18 & decodeTalentChoices", () => {
     const meepoSteps = decodeSkillBuild1To18(meepo, meepoLogits, 0, numClasses, 14, 15, byId);
     expect(meepoSteps.filter((s) => s.isUltimate).map((s) => s.level)).toEqual([2, 10, 17]);
     expect(meepoSteps[17]!.level).toBe(18);
-    expect(meepoSteps[17]!.kind).toBe("empty");
+    expect(meepoSteps[17]!.kind).toBe("attribute");
     expect(meepoSteps[17]!.abilityId).toBeNull();
   });
 });
@@ -822,7 +839,7 @@ describe("real v2 ONNX bundle inference in Node/WASM", () => {
     expect(fullView.accuracyTiles.length).toBeGreaterThanOrEqual(5);
     expect(
       fullView.overviewTiles.concat(fullView.accuracyTiles).every(
-        (t) => !t.value.includes("NaN") && !t.sub.includes("NaN"),
+        (t) => !t.value.includes("NaN") && (!t.sub || !t.sub.includes("NaN")),
       ),
     ).toBe(true);
 
@@ -833,5 +850,66 @@ describe("real v2 ONNX bundle inference in Node/WASM", () => {
     expect(minimalView.patchName).toBe(vocab.game_version_name);
     expect(minimalView.overviewTiles.some((t) => t.value.includes("heroes"))).toBe(true);
     expect(minimalView.accuracyTiles).toHaveLength(0);
+  });
+
+  it("partitions boots cleanly and computes per-ability picked levels and rank caps", () => {
+    expect(isBootItemShortName("power_treads")).toBe(true);
+    expect(isBootItemShortName("guardian_greaves")).toBe(true);
+    expect(isBootItemShortName("black_king_bar")).toBe(false);
+    expect(formatTimingShort(6.4)).toBe("6m");
+    expect(formatTimingShort(16.6)).toBe("17m");
+
+    const { bootItem, coreItems } = splitBootsAndCoreItems([
+      {
+        itemToken: 10,
+        itemId: 180,
+        shortName: "arcane_boots",
+        displayName: "Arcane Boots",
+        cost: 1500,
+        img: null,
+        expectedMinute: 6.2,
+      },
+      {
+        itemToken: 11,
+        itemId: 1,
+        shortName: "blink",
+        displayName: "Blink Dagger",
+        cost: 2250,
+        img: null,
+        expectedMinute: 12.8,
+      },
+      {
+        itemToken: 12,
+        itemId: 231,
+        shortName: "guardian_greaves",
+        displayName: "Guardian Greaves",
+        cost: 4450,
+        img: null,
+        expectedMinute: 23.4,
+      },
+    ]);
+    expect(bootItem?.shortName).toBe("arcane_boots");
+    expect(coreItems.map((i) => i.shortName)).toEqual(["blink", "guardian_greaves"]);
+
+    const hero = makeStandardHero();
+    const abilities = makeAbilitiesMap();
+    const entries = getLevelableSkillEntries(hero, abilities);
+    const numClasses = 16;
+    const logits = new Float32Array(18 * numClasses).fill(-2);
+    for (let lvl = 0; lvl < 18; lvl++) {
+      logits[lvl * numClasses + 3] = 10;
+      logits[lvl * numClasses + 0] = 8;
+      logits[lvl * numClasses + 1] = 6;
+      logits[lvl * numClasses + 2] = 4;
+      logits[lvl * numClasses + 14] = 9;
+      logits[lvl * numClasses + 15] = 1;
+    }
+    const steps = decodeSkillBuild1To18(hero, logits, 0, numClasses, 14, 15, abilities);
+    const qLevels = getAbilityPickedLevels(entries[0]!, entries, steps);
+    const rLevels = getAbilityPickedLevels(entries[3]!, entries, steps);
+    expect(qLevels).toHaveLength(4);
+    expect(rLevels).toEqual([6, 12, 18]);
+    expect(getMaxAbilityRanks(hero.id, entries[0]!, qLevels.length)).toBe(4);
+    expect(getMaxAbilityRanks(hero.id, entries[3]!, rLevels.length)).toBe(3);
   });
 });

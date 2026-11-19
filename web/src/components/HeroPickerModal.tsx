@@ -3,6 +3,7 @@ import { Search, X } from "lucide-react";
 
 import { ROLE_NAMES } from "../data/draftPresets";
 import type { DraftSlot, HeroMeta } from "../types/oracle";
+import { AttributeIcon } from "./DotaIcons";
 import { HeroPortraitImg } from "./HeroPortraitImg";
 
 interface HeroPickerModalProps {
@@ -14,12 +15,12 @@ interface HeroPickerModalProps {
   onClose: () => void;
 }
 
-const ATTR_FILTERS: ReadonlyArray<{ key: string; label: string; dotClass?: string }> = [
+const ATTR_FILTERS: ReadonlyArray<{ key: string; label: string; attrIcon?: string }> = [
   { key: "all_filter", label: "All attributes" },
-  { key: "str", label: "Strength", dotClass: "attr-dot--str" },
-  { key: "agi", label: "Agility", dotClass: "attr-dot--agi" },
-  { key: "int", label: "Intelligence", dotClass: "attr-dot--int" },
-  { key: "all", label: "Universal", dotClass: "attr-dot--all" },
+  { key: "str", label: "Strength", attrIcon: "str" },
+  { key: "agi", label: "Agility", attrIcon: "agi" },
+  { key: "int", label: "Intelligence", attrIcon: "int" },
+  { key: "all", label: "Universal", attrIcon: "all" },
 ];
 
 const ATTR_GROUPS: ReadonlyArray<{
@@ -175,10 +176,7 @@ export function HeroPickerModal({
             </span>
           ) : showAttrMetaInCard ? (
             <span className="hero-option__sub">
-              <span
-                className={`attr-dot attr-dot--${hero.primary_attr ?? "all"}`}
-                aria-hidden="true"
-              />
+              <AttributeIcon attr={hero.primary_attr} size={13} />
               <span>{formatAttrShort(hero.primary_attr)}</span>
             </span>
           ) : null}
@@ -257,8 +255,8 @@ export function HeroPickerModal({
                 aria-pressed={attrFilter === f.key}
                 onClick={() => setAttrFilter(f.key)}
               >
-                {f.dotClass ? (
-                  <span className={`attr-dot ${f.dotClass}`} aria-hidden="true" />
+                {f.attrIcon ? (
+                  <AttributeIcon attr={f.attrIcon} size={14} />
                 ) : null}
                 <span>{f.label}</span>
               </button>
@@ -290,7 +288,7 @@ export function HeroPickerModal({
                   aria-label={`${group.label} heroes`}
                 >
                   <header className="picker-group__head">
-                    <span className={`attr-dot attr-dot--${group.attr}`} aria-hidden="true" />
+                    <AttributeIcon attr={group.attr} size={15} />
                     <span className={`picker-group__title picker-group__title--${group.attr}`}>
                       {group.label}
                     </span>

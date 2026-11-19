@@ -13,7 +13,7 @@ interface ModelInfoModalProps {
 export interface ModelInfoTile {
   label: string;
   value: string;
-  sub: string;
+  sub?: string;
 }
 
 export interface ModelInfoViewData {
@@ -105,7 +105,6 @@ export function buildModelInfoViewData(
     {
       label: "Browser Footprint",
       value: bundleVal,
-      sub: "Runs locally on device",
     },
   ];
 
@@ -115,7 +114,6 @@ export function buildModelInfoViewData(
     accuracyTiles.push({
       label: "Match Winner Pick",
       value: winPct,
-      sub: "Pre-game draft outcome",
     });
   }
 
@@ -124,7 +122,6 @@ export function buildModelInfoViewData(
     accuracyTiles.push({
       label: "Skill Order (Lv 1–18)",
       value: skillPct,
-      sub: "Level-by-level ability pick",
     });
   }
 
@@ -133,7 +130,6 @@ export function buildModelInfoViewData(
     accuracyTiles.push({
       label: "Talent Choices (10–25)",
       value: talentPct,
-      sub: "Tier branch selection",
     });
   }
 
@@ -167,7 +163,6 @@ export function buildModelInfoViewData(
     accuracyTiles.push({
       label: "Economy Margin",
       value: `±${Math.round(summary.gpm_mae)} GPM`,
-      sub: "Average gold-rate spread",
     });
   }
 
@@ -251,7 +246,7 @@ export function ModelInfoModal({
                 <div key={tile.label} className="econ-stat">
                   <span className="econ-stat__label">{tile.label}</span>
                   <span className="econ-stat__val measured">{tile.value}</span>
-                  <span className="econ-stat__sub">{tile.sub}</span>
+                  {tile.sub && <span className="econ-stat__sub">{tile.sub}</span>}
                 </div>
               ))}
             </div>
@@ -268,7 +263,7 @@ export function ModelInfoModal({
                   <div key={tile.label} className="econ-stat">
                     <span className="econ-stat__label">{tile.label}</span>
                     <span className="econ-stat__val measured">{tile.value}</span>
-                    <span className="econ-stat__sub">{tile.sub}</span>
+                    {tile.sub && <span className="econ-stat__sub">{tile.sub}</span>}
                   </div>
                 ))}
               </div>
@@ -281,7 +276,7 @@ export function ModelInfoModal({
               <strong>Expected Pace</strong>.
             </p>
             <p className="model-info-note">
-              Built from Ranked &amp; League Captains Mode matches collected via STRATZ and OpenDota.
+              Built from Ranked &amp; League Captains Mode matches on the active patch.
             </p>
           </div>
         </div>
