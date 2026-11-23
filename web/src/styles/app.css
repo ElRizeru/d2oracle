@@ -889,6 +889,37 @@
     padding: 4px var(--space-xs);
   }
 
+  .draft-mini-bar {
+    padding: 10px var(--space-sm);
+    gap: 10px;
+  }
+
+  .draft-mini-team {
+    width: 100%;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .draft-mini-team--dire .draft-mini-team__label {
+    order: -1;
+  }
+
+  .draft-mini-team__portraits {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    width: 100%;
+    gap: 4px;
+  }
+
+  .draft-mini-chip {
+    width: 100%;
+  }
+
+  .draft-mini-bar__vs {
+    display: none;
+  }
+
   .role-label--full {
     display: none;
   }
@@ -2002,6 +2033,8 @@
 }
 
 .hero-cell__build-code {
+  width: fit-content;
+  justify-self: start;
   font-size: 10px;
   line-height: 1;
   padding: 2px 5px;
@@ -2365,6 +2398,12 @@
 
 .abilities-grid-table thead th:first-child {
   width: 12.25rem;
+}
+
+@media (min-width: 68.01rem) {
+  .abilities-grid-table thead th:first-child {
+    width: 15.5rem;
+  }
 }
 
 .ab-grid__th {
@@ -2762,6 +2801,29 @@
   width: 15.5rem;
 }
 
+@media (max-width: 68rem) {
+  .combat-table {
+    min-width: 0;
+  }
+
+  .combat-table th,
+  .combat-table td {
+    padding: 8px 6px;
+  }
+
+  .combat-table thead th:nth-child(1) {
+    width: 12.25rem;
+  }
+
+  .combat-table .metric-cell--bar {
+    min-width: 5.1rem;
+  }
+
+  .combat-table .combat-cell {
+    min-width: 4.55rem;
+  }
+}
+
 .kda-inline {
   display: inline-flex;
   align-items: baseline;
@@ -3041,10 +3103,13 @@
 .focus-circle-btn__name {
   font-size: 11px;
   font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.15;
+  text-align: center;
+  min-height: 2.3em;
+  display: grid;
+  align-items: center;
   max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 /* Focus / Drawer Hero Detail Bento */
@@ -3662,11 +3727,22 @@
   }
 
   .detail-item-row {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    gap: 6px;
+  }
+
+  .detail-item-row__name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: var(--text-xs);
   }
 
   .detail-item-row__meta {
     margin-left: auto;
+    gap: 6px;
+    font-size: 11px;
   }
 }
 
@@ -3756,6 +3832,7 @@
 .econ-stat {
   display: grid;
   gap: 2px;
+  align-content: start;
   padding: 8px 10px;
   border-radius: var(--radius-pill);
   border: var(--rule-hair) solid var(--color-rule);
