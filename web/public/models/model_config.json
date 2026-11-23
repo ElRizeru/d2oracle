@@ -16,11 +16,11 @@
   "dropout": 0.1,
   "stage2_num_layers": 2,
   "stage1_pair_dim": 28,
-  "stage1_pair_dropout": 0.25,
-  "stage1_win_trunk_scale": 0.45,
+  "stage1_pair_dropout": 0.35,
+  "stage1_win_trunk_scale": 0.25,
   "use_stage2_block": true,
   "eos_logit_penalty": 0.0,
-  "eos_stop_prob": 0.25,
+  "eos_stop_prob": 0.22,
   "model_schema_version": 2,
   "encoder_arch_version": 4,
   "parquet_schema_version": 2,
@@ -37,7 +37,7 @@
     "heal_share_min_team_sum": 500.0
   },
   "model_summary": {
-    "trained_at_utc": "2026-11-23T16:56:33.698830+00:00",
+    "trained_at_utc": "2026-11-23T18:56:07.248807+00:00",
     "dataset_snapshot_utc": "2026-11-19T00:28:52.377145+00:00",
     "total_matches": 65000,
     "ranked_matches": 64956,
@@ -48,14 +48,14 @@
     "num_heroes": 127,
     "num_key_items": 106,
     "bundle_size_mb": 15.32,
-    "win_accuracy": 0.5803,
-    "lane_accuracy": 0.4823,
-    "duration_mae_min": 7.36,
-    "duration_window_coverage": 0.5229,
-    "skill_accuracy": 0.7515,
-    "talent_accuracy": 0.7219,
-    "item_accuracy": 0.5273,
-    "item_timing_mae_min": 2.46,
-    "gpm_mae": 77.5
+    "win_accuracy": 0.5746,
+    "lane_accuracy": 0.4819,
+    "duration_mae_min": 7.35,
+    "duration_window_coverage": 0.5334,
+    "skill_accuracy": 0.7516,
+    "talent_accuracy": 0.7212,
+    "item_accuracy": 0.5317,
+    "item_timing_mae_min": 2.44,
+    "gpm_mae": 77.7
   }
 }
