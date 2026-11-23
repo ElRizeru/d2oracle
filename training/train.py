@@ -10,6 +10,7 @@ import os
 import random
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -388,6 +389,42 @@ def _build_batch_loader(
     )
 
 
+def resolve_adaptive_training_schedule(
+    num_train: int, cfg: TrainingConfig
+) -> TrainingConfig:
+    """Scale batch size, Phase-1/2 epoch budgets, and FM L2 regularization cleanly to dataset size."""
+    if num_train <= 0:
+        return cfg
+
+    bs = int(cfg.batch_size)
+    if num_train < 150_000 and bs > 256:
+        bs = 256
+    bs = min(bs, max(1, num_train))
+    steps_per_ep = max(1, (num_train + bs - 1) // bs)
+
+    target_s2_steps = max(500, int(cfg.target_stage2_steps))
+    s2_epochs = min(24, max(12, round(target_s2_steps / steps_per_ep)))
+
+    if cfg.two_phase:
+        s1_epochs = min(8, max(5, round(1800 / steps_per_ep)))
+        total_epochs = s1_epochs + s2_epochs
+    else:
+        s1_epochs = cfg.stage1_epochs
+        total_epochs = max(cfg.epochs, s2_epochs)
+
+    # Gently strengthen BilinearFM L2 regularization below 200k matches to curb early win overfitting.
+    fm_scale = min(2.0, max(1.0, (200_000.0 / float(max(20_000, num_train))) ** 0.5))
+    fm_l2 = round(float(cfg.fm_l2_weight) * fm_scale, 7)
+
+    return replace(
+        cfg,
+        batch_size=bs,
+        epochs=total_epochs,
+        stage1_epochs=s1_epochs,
+        fm_l2_weight=fm_l2,
+    )
+
+
 def _resolve_stage1_epochs(cfg: TrainingConfig) -> int:
     if not cfg.two_phase or cfg.epochs < 2:
         return 0
@@ -629,6 +666,17 @@ def train_from_datasets(
     vidx: VocabIndex | None = None,
 ) -> dict[str, Any]:
     """Train D2OracleModel from pre-built PyTorch Datasets and save checkpoints + metadata."""
+    last_path = cfg.checkpoint_dir / "last.pt"
+    if cfg.auto_schedule and not (cfg.resume and last_path.exists()):
+        cfg = resolve_adaptive_training_schedule(len(train_ds), cfg)
+        logger.info(
+            "Adaptive schedule (n_train=%d): batch_size=%d, epochs=%d (s1=%s), fm_l2=%.6f",
+            len(train_ds),
+            cfg.batch_size,
+            cfg.epochs,
+            cfg.stage1_epochs,
+            cfg.fm_l2_weight,
+        )
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vidx = vidx or VocabIndex(vocab)
@@ -654,7 +702,6 @@ def train_from_datasets(
     best_stage1_metrics: dict[str, float] | None = None
     best_stage1_path = cfg.checkpoint_dir / "best_stage1.pt"
     best_path = cfg.checkpoint_dir / "best.pt"
-    last_path = cfg.checkpoint_dir / "last.pt"
     history: list[dict[str, Any]] = []
     start_epoch = 1
     resume_phase: int | None = None
@@ -1179,6 +1226,7 @@ def train_from_datasets(
         "model_config_path": cfg.checkpoint_dir / "model_config.json",
         "history": history,
         "spec": spec,
+        "resolved_config": cfg,
         "best_epoch": best_epoch,
         "best_val_metrics": best_val_metrics,
         "best_stage1_epoch": best_stage1_epoch,

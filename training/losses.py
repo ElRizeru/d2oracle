@@ -111,9 +111,29 @@ def compute_multitask_loss_tensors(
                 reduction="none",
             ).view(bsz, 3)
             loss_lane5 = _weighted_masked_mean(lane_ce5, valid5.to(torch.float32), sample_weight)
+            emd_w = min(0.5, max(0.0, float(getattr(cfg, "lane_emd_weight", 0.0))))
+            if emd_w > 0.0:
+                probs5 = F.softmax(lane_logits5.float(), dim=-1)
+                cdf_pred = probs5.cumsum(dim=-1)[..., :4]
+                target5_oh = F.one_hot(
+                    torch.where(valid5, torch.clamp(lane5_targets, min=0, max=4), 0),
+                    num_classes=5,
+                ).to(torch.float32)
+                cdf_true = target5_oh.cumsum(dim=-1)[..., :4]
+                lane_emd5 = (cdf_pred - cdf_true).pow(2).mean(dim=-1)
+                loss_lane_emd = _weighted_masked_mean(
+                    lane_emd5, valid5.to(torch.float32), sample_weight
+                )
+                blended_lanes = (
+                    (0.70 - 0.5 * emd_w) * loss_lanes
+                    + (0.30 - 0.5 * emd_w) * loss_lane5
+                    + emd_w * loss_lane_emd
+                )
+            else:
+                blended_lanes = 0.70 * loss_lanes + 0.30 * loss_lane5
             loss_lanes = torch.where(
                 valid5.any(),
-                0.70 * loss_lanes + 0.30 * loss_lane5,
+                blended_lanes,
                 loss_lanes,
             )
 
@@ -213,10 +233,12 @@ def compute_multitask_loss_tensors(
         item_logits = outputs["item_logits"].float()
         item_targets = batch["item_target_ids"]
         valid_items = item_targets != PAD_ITEM_ID
+        item_smooth = min(0.25, max(0.0, float(getattr(cfg, "item_label_smoothing", 0.0))))
         item_ce = F.cross_entropy(
             item_logits.reshape(-1, item_logits.shape[-1]),
             item_targets.reshape(-1),
             ignore_index=PAD_ITEM_ID,
+            label_smoothing=item_smooth,
             reduction="none",
         ).view(bsz, 10, item_targets.shape[2])
         loss_item_ce = _weighted_masked_mean(item_ce, valid_items.to(torch.float32), build_weight)
@@ -234,6 +256,16 @@ def compute_multitask_loss_tensors(
             item_time_diff, torch.zeros_like(item_time_diff), reduction="none", beta=0.4
         )
         loss_item_time = _weighted_masked_mean(item_time_err, time_mask, sample_weight)
+        mono_w = max(0.0, float(getattr(cfg, "item_time_mono_weight", 0.0)))
+        if mono_w > 0.0 and pred_item_minutes.shape[2] > 1:
+            pair_mask = time_mask[:, :, 1:] * time_mask[:, :, :-1]
+            mono_viol = F.relu(
+                (pred_item_minutes[:, :, :-1] - pred_item_minutes[:, :, 1:])
+                / ITEM_TIME_LOSS_SCALE_MIN
+            )
+            loss_item_time = loss_item_time + mono_w * _weighted_masked_mean(
+                mono_viol, pair_mask, sample_weight
+            )
 
         skill_logits = outputs["skill_logits"].float()
         skill_targets = batch["skill_targets"]

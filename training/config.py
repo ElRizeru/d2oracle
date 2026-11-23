@@ -81,12 +81,12 @@ class TrainingConfig:
     dropout: float = 0.1
     max_item_len: int = 12  # <BOS> + up to 11 items / <EOS>
     stage1_pair_dim: int = 28
-    stage1_pair_dropout: float = 0.25
-    fm_l2_weight: float = 1e-4
-    stage1_win_trunk_scale: float = 0.45
+    stage1_pair_dropout: float = 0.35
+    fm_l2_weight: float = 3e-4
+    stage1_win_trunk_scale: float = 0.25
     use_stage2_block: bool = True
     eos_logit_penalty: float = 0.0
-    eos_stop_prob: float = 0.25
+    eos_stop_prob: float = 0.22
 
     # Optimization & two-phase curriculum
     batch_size: int = 64
@@ -94,7 +94,9 @@ class TrainingConfig:
     two_phase: bool = True
     stage1_epochs: int | None = None
     stage1_patience: int = 3
-    stage2_patience: int = 4
+    stage2_patience: int = 5
+    auto_schedule: bool = False
+    target_stage2_steps: int = 5500
     fit_win_temperature: bool = True
     lr: float = 3e-4
     stage1_lr: float | None = None
@@ -119,22 +121,25 @@ class TrainingConfig:
     pro_sample_weight: float = 1.0
     # Per-player weight on losing builds for discrete build heads (item_ce, skill, talent)
     loser_build_weight: float = 0.35
-    # Mild label smoothing on win BCE target to reduce early win_head overfitting
+    # Mild label smoothing on discrete classification heads to curb overconfident memorization
     win_label_smoothing: float = 0.01
+    item_label_smoothing: float = 0.05
 
     # Multi-task loss weights (normalized scales across Stage 1 and Stage 2)
     w_win: float = 2.0
     w_duration: float = 2.0
     w_lanes: float = 0.8
+    lane_emd_weight: float = 0.20
     w_lead10: float = 0.5
     w_combat_rate: float = 0.8
     w_combat_share: float = 0.6
     w_econ_kda: float = 0.8
     w_item_ce: float = 1.0
     w_item_time: float = 1.5
-    w_skill: float = 0.8
-    w_skill_rank_penalty: float = 0.08
-    w_talent: float = 0.6
+    item_time_mono_weight: float = 0.10
+    w_skill: float = 1.0
+    w_skill_rank_penalty: float = 0.25
+    w_talent: float = 0.85
 
     def to_dict(self) -> dict[str, Any]:
         raw = asdict(self)

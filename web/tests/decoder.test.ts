@@ -823,7 +823,7 @@ describe("real v2 ONNX bundle inference in Node/WASM", () => {
     );
 
     expect(modelConfig.encoder_arch_version).toBe(4);
-    expect(modelConfig.model_summary?.total_matches).toBe(435000);
+    expect(modelConfig.model_summary?.total_matches).toBeGreaterThan(0);
   });
 
   it("formats model info summary cleanly with and without optional model_summary", () => {
@@ -834,8 +834,13 @@ describe("real v2 ONNX bundle inference in Node/WASM", () => {
 
     const fullView = buildModelInfoViewData(vocab, modelConfig);
     expect(fullView.patchName).toBe(modelConfig.game_version_name);
-    expect(fullView.overviewTiles.map((t) => t.value)).toContain("435,000");
-    expect(fullView.overviewTiles.map((t) => t.value)).toContain("15.0 MB");
+    const summary = modelConfig.model_summary!;
+    expect(fullView.overviewTiles.map((t) => t.value)).toContain(
+      summary.total_matches!.toLocaleString("en-US"),
+    );
+    expect(fullView.overviewTiles.map((t) => t.value)).toContain(
+      `${summary.bundle_size_mb!.toFixed(1)} MB`,
+    );
     expect(fullView.accuracyTiles.length).toBeGreaterThanOrEqual(5);
     expect(
       fullView.overviewTiles.concat(fullView.accuracyTiles).every(

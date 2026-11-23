@@ -14,6 +14,7 @@ export const BOOT_ITEM_SHORT_NAMES: ReadonlySet<string> = new Set([
   "travel_boots_2",
   "guardian_greaves",
   "boots_of_bearing",
+  "berserkers_sabatons",
 ]);
 
 export function isBootItemShortName(shortName: string): boolean {

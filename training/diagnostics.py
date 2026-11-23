@@ -1072,8 +1072,9 @@ def write_training_report(
     history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
     written["history"] = history_path
 
+    effective_cfg = train_result.get("resolved_config") or cfg
     cfg_payload = {
-        "training_config": cfg.to_dict(),
+        "training_config": effective_cfg.to_dict(),
         "model_config": model_config
         or (train_result["spec"].to_dict() if "spec" in train_result else None),
         "dataset": train_result.get("dataset_summary"),

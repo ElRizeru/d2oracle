@@ -61,6 +61,7 @@ from training.train import (
     compute_stage1_val_score,
     compute_stage2_val_score,
     fit_win_temperature,
+    resolve_adaptive_training_schedule,
     train_from_datasets,
     train_from_rows,
     train_from_shards,
@@ -2214,3 +2215,101 @@ def test_v4_stage1_early_stop_temperature_cal_and_loader_keys(
     res_s2es = train_from_rows(train_rows, val_rows, sample_vocab, cfg_s2es)
     assert any(h["phase"] == 2 for h in res_s2es["history"])
     assert len(res_s2es["history"]) <= 12
+
+
+def test_adaptive_schedule_and_improved_loss_terms(
+    tmp_path: Path, sample_vocab: dict[str, Any]
+) -> None:
+    base_cfg = TrainingConfig(
+        checkpoint_dir=tmp_path / "ckpt_adapt",
+        data_dir=tmp_path / "data",
+        export_dir=tmp_path / "export",
+        batch_size=512,
+        epochs=20,
+        stage1_epochs=8,
+        fm_l2_weight=3e-4,
+        auto_schedule=True,
+        target_stage2_steps=5500,
+    )
+    small_cfg = resolve_adaptive_training_schedule(58_500, base_cfg)
+    assert small_cfg.batch_size == 256
+    assert small_cfg.stage1_epochs == 8
+    assert small_cfg.epochs == 32
+    assert small_cfg.fm_l2_weight > base_cfg.fm_l2_weight
+
+    large_cfg = resolve_adaptive_training_schedule(400_000, base_cfg)
+    assert large_cfg.batch_size == 512
+    assert large_cfg.epochs < small_cfg.epochs
+    assert large_cfg.fm_l2_weight == pytest.approx(base_cfg.fm_l2_weight, abs=1e-7)
+
+    vidx = VocabIndex(sample_vocab)
+    rows = [
+        _make_training_row(match_id=850000 + i, start_datetime=1795000000 + i, radiant_win=True)
+        for i in range(2)
+    ]
+    ds = DotaDraftDataset(rows, vidx, max_item_len=8)
+    batch = {k: torch.stack([ds[0][k], ds[1][k]], dim=0) for k in ds[0]}
+    spec = build_model_spec(vidx, TrainingConfig(d_model=32, nhead=4, num_encoder_layers=1, num_decoder_layers=1, dim_feedforward=64, max_item_len=8))
+    model = D2OracleModel(spec, vidx.build_skill_mask())
+    model.eval()
+    with torch.no_grad():
+        base_out = model(
+            batch["hero_idx"],
+            batch["is_radiant"],
+            batch["pos_idx"],
+            batch["item_input_ids"],
+        )
+
+    # 1. Ordinal EMD term in loss_lanes must penalize extreme misclassifications > adjacent tie
+    batch_lane = {k: v.clone() for k, v in batch.items()}
+    batch_lane["lane_targets"].fill_(0)  # Radiant
+    batch_lane["lane5_targets"].fill_(1)  # RadWin (ordinal idx 1)
+
+    out_adj = {k: v.clone() for k, v in base_out.items()}
+    out_adj["lane_logits5"] = torch.full_like(base_out["lane_logits5"], -10.0)
+    out_adj["lane_logits5"][..., 2] = 10.0  # Tie (distance 1 from RadWin)
+    p_adj = torch.softmax(out_adj["lane_logits5"], dim=-1)
+    out_adj["lane_probs"] = torch.stack(
+        [p_adj[..., 0] + p_adj[..., 1], p_adj[..., 2], p_adj[..., 3] + p_adj[..., 4]], dim=-1
+    )
+    out_adj["lane_logits"] = torch.log(out_adj["lane_probs"].clamp(min=1e-7))
+
+    out_far = {k: v.clone() for k, v in base_out.items()}
+    out_far["lane_logits5"] = torch.full_like(base_out["lane_logits5"], -10.0)
+    out_far["lane_logits5"][..., 4] = 10.0  # DireStomp (distance 3 from RadWin)
+    p_far = torch.softmax(out_far["lane_logits5"], dim=-1)
+    out_far["lane_probs"] = torch.stack(
+        [p_far[..., 0] + p_far[..., 1], p_far[..., 2], p_far[..., 3] + p_far[..., 4]], dim=-1
+    )
+    out_far["lane_logits"] = torch.log(out_far["lane_probs"].clamp(min=1e-7))
+
+    cfg_emd = TrainingConfig(max_item_len=8, lane_emd_weight=0.25)
+    _, sc_adj = compute_multitask_loss(out_adj, batch_lane, cfg_emd, stage_mode="stage1")
+    _, sc_far = compute_multitask_loss(out_far, batch_lane, cfg_emd, stage_mode="stage1")
+    assert sc_far["loss_lanes"] > sc_adj["loss_lanes"] + 0.05
+
+    # 2. Monotonic item timing penalty + label smoothing
+    out_mono = {k: v.clone() for k, v in base_out.items()}
+    out_rev = {k: v.clone() for k, v in base_out.items()}
+    # Match target item times monotonically increasing, test mono vs non-mono predictions at steps 0 & 1
+    out_mono["item_minutes"][..., 0, :] = 8.0
+    out_mono["item_minutes"][..., 1, :] = 18.0
+    out_rev["item_minutes"][..., 0, :] = 18.0
+    out_rev["item_minutes"][..., 1, :] = 8.0
+    batch_item = {k: v.clone() for k, v in batch.items()}
+    batch_item["item_target_minutes"][:, :, 0] = 13.0
+    batch_item["item_target_minutes"][:, :, 1] = 13.0
+    batch_item["item_time_mask"].zero_()
+    batch_item["item_time_mask"][:, :, :2] = 1.0
+
+    cfg_item = TrainingConfig(
+        max_item_len=8, item_time_mono_weight=0.20, item_label_smoothing=0.05
+    )
+    cfg_no_item = TrainingConfig(
+        max_item_len=8, item_time_mono_weight=0.0, item_label_smoothing=0.0
+    )
+    _, sc_mono = compute_multitask_loss(out_mono, batch_item, cfg_item, stage_mode="stage2")
+    _, sc_rev = compute_multitask_loss(out_rev, batch_item, cfg_item, stage_mode="stage2")
+    _, sc_plain = compute_multitask_loss(out_mono, batch_item, cfg_no_item, stage_mode="stage2")
+    assert sc_rev["loss_item_time"] > sc_mono["loss_item_time"] + 0.3
+    assert sc_mono["loss_item_ce"] != pytest.approx(sc_plain["loss_item_ce"], abs=1e-4)
